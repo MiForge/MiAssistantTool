@@ -229,6 +229,12 @@ const char *validate_check(const char *md5, int flash) {
     }
 
     size_t post_buf_len = strlen(json_post_data) + strlen("q=&t=&s=1") + 1;
+    /* post_buf is reused below to hold the server's decoded/decrypted response
+     * (EVP_DecodeBlock + AES-CBC decrypt write back into it), which is
+     * typically larger than the outgoing request. Sizing it to only the
+     * request length caused a heap buffer overflow (observed as
+     * STATUS_HEAP_CORRUPTION on Windows) as soon as the response didn't fit. */
+    if (post_buf_len < 8192) post_buf_len = 8192;
     unsigned char *post_buf = (unsigned char *)malloc(post_buf_len);
     if (!post_buf) {
         curl_free(json_post_data);
@@ -262,7 +268,11 @@ const char *validate_check(const char *md5, int flash) {
         return NULL;
     }
     fclose(response_file);
-    free(post_buf);
+    /* post_buf is NOT freed here (unlike the error path above): it is
+     * reused below to hold the decoded/decrypted response and is read
+     * through json_create()'s in-place parsing for the rest of this
+     * function. Freeing it here was a use-after-free on every successful
+     * request - the buffer would still be reused right after being freed. */
     curl_easy_cleanup(curl);
 
     FILE *response_file_read = fopen("response.tmp", "rb");
@@ -329,13 +339,17 @@ const char *validate_check(const char *md5, int flash) {
     } else {
         if (json_getType(parsed_json) == JSON_OBJ) {
             json_t const *child = json_getChild(parsed_json);
-            if (strcmp(json_getName(json_getSibling(child)), "Signup") == 0 || strcmp(json_getName(json_getSibling(child)), "VersionBoot") == 0) {
+            /* json_getSibling()/json_getName() dereference their argument with
+             * no NULL check (tiny-json), so a response object with 0 or 1
+             * property crashed here with a NULL pointer dereference. */
+            json_t const *firstSibling = child ? json_getSibling(child) : NULL;
+            if (firstSibling && (strcmp(json_getName(firstSibling), "Signup") == 0 || strcmp(json_getName(firstSibling), "VersionBoot") == 0)) {
                 fprintf(stderr, "Error: Invalid data\n");
                 return NULL;
             }
             while (child) {
-                child = json_getSibling(child); 
-                if (strcmp(json_getName(child), "Icon") == 0) {
+                child = json_getSibling(child);
+                if (!child || strcmp(json_getName(child), "Icon") == 0) {
                     break;
                 }
                 json_t const *cA = json_getProperty(parsed_json, json_getName(child));
@@ -354,18 +368,32 @@ const char *validate_check(const char *md5, int flash) {
 int start_sideload(const char *sideload_file, const char *validate) {
 
     printf("\n\n");
-    FILE *fp = fopen(sideload_file, "r");
+    /* "rb": must be binary, not text mode. On Windows the CRT's text-mode
+     * translation treats byte 0x1A as EOF and rewrites CRLF sequences,
+     * silently truncating/corrupting the ROM data being streamed below. */
+    FILE *fp = fopen(sideload_file, "rb");
     if (!fp) {
         perror("Failed to open file");
         return 1;
     }
 
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);  
+    /* file_size/offsets must be 64-bit: `long` is 32-bit on Windows (LLP64)
+     * even in a 64-bit build, so it silently overflows/wraps for any ROM
+     * over ~2GB (i.e. basically every recovery ROM this tool flashes). That
+     * corrupts the sideload-host size announced to the device and the
+     * per-chunk file offsets, aborting the transfer partway through. */
+#ifdef _WIN32
+    _fseeki64(fp, 0, SEEK_END);
+    long long file_size = _ftelli64(fp);
+    _fseeki64(fp, 0, SEEK_SET);
+#else
+    fseeko(fp, 0, SEEK_END);
+    long long file_size = ftello(fp);
+    fseeko(fp, 0, SEEK_SET);
+#endif
     char sideload_host_command[128 + strlen(validate)];
     memset(sideload_host_command, 0, sizeof(sideload_host_command));
-    sprintf(sideload_host_command, "sideload-host:%ld:%d:%s:0", file_size, ADB_SIDELOAD_CHUNK_SIZE, validate);
+    sprintf(sideload_host_command, "sideload-host:%lld:%d:%s:0", file_size, ADB_SIDELOAD_CHUNK_SIZE, validate);
 
     send_command(ADB_OPEN, 1, 0, sideload_host_command, strlen(sideload_host_command) + 1);
 
@@ -379,7 +407,7 @@ int start_sideload(const char *sideload_file, const char *validate) {
     char dummy_data[64];
     int dummy_data_size;
     adb_usb_packet pkt;
-    long total_sent = 0;
+    long long total_sent = 0;
 
     while (1) {
         pkt.cmd = 0;
@@ -405,13 +433,17 @@ int start_sideload(const char *sideload_file, const char *validate) {
             continue;
         }
 
-        long block = strtol(dummy_data, NULL, 10);
-        long offset = block * ADB_SIDELOAD_CHUNK_SIZE;
+        long long block = strtoll(dummy_data, NULL, 10);
+        long long offset = block * ADB_SIDELOAD_CHUNK_SIZE;
         if (offset > file_size) break;
         int to_write = ADB_SIDELOAD_CHUNK_SIZE;
-        if(offset + ADB_SIDELOAD_CHUNK_SIZE > file_size) 
-            to_write = file_size - offset;        
-        fseek(fp, offset, SEEK_SET);
+        if(offset + ADB_SIDELOAD_CHUNK_SIZE > file_size)
+            to_write = file_size - offset;
+#ifdef _WIN32
+        _fseeki64(fp, offset, SEEK_SET);
+#else
+        fseeko(fp, offset, SEEK_SET);
+#endif
         fread(work_buffer, 1, to_write, fp);
         send_command(ADB_WRTE, pkt.arg1, pkt.arg0, work_buffer, to_write);
         send_command(ADB_OKAY, pkt.arg1, pkt.arg0, NULL, 0);
