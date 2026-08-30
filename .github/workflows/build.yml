@@ -40,6 +40,7 @@ jobs:
     - name: Install Dependencies
       run: |
         docker run --privileged aptman/qus -s -- -p aarch64 arm
+        sudo apt-get update
         sudo apt-get install -y mingw-w64 libusb-1.0-0-dev libssl-dev libcurl4-openssl-dev
         git clone https://github.com/rafagafe/tiny-json.git
         curl -L -o openssl.zip https://www.firedaemon.com/download-firedaemon-openssl-4-0-zip && 7z x openssl.zip -o./openssl_raw && mkdir -p openssl && mv openssl_raw/x64 openssl/x64

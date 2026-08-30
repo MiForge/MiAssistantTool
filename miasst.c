@@ -1,4 +1,4 @@
-#define VERSION "1.2"
+#define VERSION "1.3"
 #define REPOSITORY "https://github.com/offici5l/MiAssistantTool"
 
 #ifdef _WIN32
