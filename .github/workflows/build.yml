@@ -29,8 +29,9 @@ jobs:
         else
           echo "Tag $VERSION already exists, skipping tag creation."
         fi
+        awk -v ver="$VERSION" '$0=="## " ver {f=1; next} /^## / {f=0} f' CHANGELOG.md > release_notes.md
         if ! gh release view $VERSION; then
-          gh release create $VERSION --title "Release $VERSION"
+          gh release create $VERSION --title "Release $VERSION" --notes-file release_notes.md
         else
           echo "Release $VERSION already exists, skipping release creation."
         fi
@@ -41,28 +42,25 @@ jobs:
         docker run --privileged aptman/qus -s -- -p aarch64 arm
         sudo apt-get install -y mingw-w64 libusb-1.0-0-dev libssl-dev libcurl4-openssl-dev
         git clone https://github.com/rafagafe/tiny-json.git
-        curl -L -o openssl.zip https://download.firedaemon.com/FireDaemon-OpenSSL/openssl-3.4.0.zip && 7z x openssl.zip -o./openssl && rm openssl.zip
+        curl -L -o openssl.zip https://www.firedaemon.com/download-firedaemon-openssl-4-0-zip && 7z x openssl.zip -o./openssl_raw && mkdir -p openssl && mv openssl_raw/x64 openssl/x64
         curl -L -o libusb.7z https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.7z && 7z x libusb.7z -o./libusb && rm libusb.7z
-        curl -L -o curl32.zip https://curl.se/windows/dl-8.11.0_1/curl-8.11.0_1-win32-mingw.zip && 7z x curl32.zip -o./curl && rm curl32.zip && mv curl/curl-8.11.0_1-win32-mingw curl/win32
-        curl -L -o curl64.zip https://curl.se/windows/dl-8.11.0_1/curl-8.11.0_1-win64-mingw.zip && 7z x curl64.zip -o./curl && rm curl64.zip && mv curl/curl-8.11.0_1-win64-mingw curl/win64
+        curl -L -o curl64.zip https://curl.se/windows/dl-8.21.0_7/curl-8.21.0_7-win64-mingw.zip && 7z x curl64.zip -o./curl && rm curl64.zip && mv curl/curl-8.21.0_7-win64-mingw curl/win64
 
     - name: Build for Windows
       run: |
-        for arch in i686 x86_64; do
-          suffix=""
-          if [ "$arch" == "i686" ]; then
-            suffix="32"
-            op="x86"
-          elif [ "$arch" == "x86_64" ]; then
-            suffix="64"
-            op="x64"
-          fi
+        x86_64-w64-mingw32-gcc -o miasst_windows64.exe miasst.c tiny-json/tiny-json.c \
+          -I./libusb/include -I./openssl/x64/include -I./curl/win64/include -I./tiny-json \
+          -L./libusb/MinGW64/static -L./openssl/x64/lib -L./curl/win64/lib \
+          -lusb-1.0 -lssl -lcrypto -lcurl -lws2_32 -lbcrypt
 
-          $arch-w64-mingw32-gcc -o miasst_windows${suffix}.exe miasst.c tiny-json/tiny-json.c \
-            -I./libusb/include -I./openssl/${op}/include -I./curl/win${suffix}/include -I./tiny-json \
-            -L./libusb/MinGW${suffix}/static -L./openssl/${op}/lib -L./curl/win${suffix}/lib \
-            -lusb-1.0 -lssl -lcrypto -lcurl
-        done
+    - name: Bundle Windows DLLs
+      run: |
+        mkdir -p bundle64
+        cp miasst_windows64.exe bundle64/
+        cp openssl/x64/bin/libcrypto-4-x64.dll openssl/x64/bin/libssl-4-x64.dll bundle64/
+        cp curl/win64/bin/libcurl-x64.dll bundle64/
+        cp libusb/MinGW64/dll/libusb-1.0.dll bundle64/
+        (cd bundle64 && zip -r ../miasst_windows64.zip .)
 
     - name: Build miasst for Termux
       run: |
@@ -82,7 +80,7 @@ jobs:
     - name: Upload
       run: |
         VERSION=$(grep -oP '#define VERSION "\K[^"]+' miasst.c)
-        gh release upload $VERSION ./miasst_windows32.exe ./miasst_windows64.exe ./miasst_ubuntu ./miasst_termux_aarch64 ./miasst_termux_arm --clobber
+        gh release upload $VERSION ./miasst_windows64.zip ./miasst_ubuntu ./miasst_termux_aarch64 ./miasst_termux_arm --clobber
 
   build-macos:
     runs-on: macos-latest

@@ -21,4 +21,6 @@ ___
 
 ### [Download ](https://github.com/MiForge/MiAssistantTool/releases/latest)
 
-If you need a version for another system ... , you can build it by cloning the repository and compiling it using GCC
+### Building for other architectures
+
+Not every architecture has a prebuilt binary. To build for yours, clone the repo and compile `miasst.c` + `tiny-json/tiny-json.c`, linking against `libusb-1.0`, `ssl`, `crypto`, and `curl`. See [`.github/workflows/build.yml`](.github/workflows/build.yml) for the exact commands used for each supported platform.
