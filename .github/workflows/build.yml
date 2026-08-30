@@ -13,9 +13,8 @@ env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
@@ -35,7 +34,14 @@ jobs:
         else
           echo "Release $VERSION already exists, skipping release creation."
         fi
-        
+
+  build:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
     - name: Install Dependencies
       run: |
@@ -84,6 +90,7 @@ jobs:
         gh release upload $VERSION ./miasst_windows64.zip ./miasst_ubuntu ./miasst_termux_aarch64 ./miasst_termux_arm --clobber
 
   build-macos:
+    needs: release
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
@@ -93,7 +100,7 @@ jobs:
 
     - name: Build miasst for macOS
       run: |
-        clang -o miasst_macos miasst.c tiny-json/tiny-json.c -I/System/Volumes/Data/opt/homebrew/Cellar/libusb/1.0.27/include -I/System/Volumes/Data/opt/homebrew/opt/openssl/include -L/System/Volumes/Data/opt/homebrew/Cellar/libusb/1.0.27/lib -L/System/Volumes/Data/opt/homebrew/opt/openssl/lib -I. -lssl -lcrypto -lcurl -lusb-1.0
+        clang -o miasst_macos miasst.c tiny-json/tiny-json.c -I/System/Volumes/Data/opt/homebrew/opt/libusb/include -I/System/Volumes/Data/opt/homebrew/opt/openssl/include -L/System/Volumes/Data/opt/homebrew/opt/libusb/lib -L/System/Volumes/Data/opt/homebrew/opt/openssl/lib -I. -lssl -lcrypto -lcurl -lusb-1.0
 
     - name: Upload macOS Build
       run: |
