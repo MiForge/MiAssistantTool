@@ -75,7 +75,7 @@ jobs:
           docker run --name $arch --privileged \
             -v $(pwd)/miasst.c:/data/data/com.termux/files/home/miasst.c \
             -v $(pwd)/tiny-json:/data/data/com.termux/files/home/tiny-json \
-            termux/termux-docker:$arch bash -c "yes | pkg install clang && yes | pkg install libusb && yes | pkg install libc++ && clang -o miasst_termux_$arch miasst.c tiny-json/tiny-json.c -I/usr/include/openssl -I. -lssl -lcrypto -lcurl -lusb-1.0"
+            termux/termux-docker:$arch bash -c "echo 'deb https://packages-cf.termux.dev/apt/termux-main stable main' > /data/data/com.termux/files/usr/etc/apt/sources.list && pkg update -y && yes | pkg install clang && yes | pkg install libusb && yes | pkg install libc++ && clang -o miasst_termux_$arch miasst.c tiny-json/tiny-json.c -I/usr/include/openssl -I. -lssl -lcrypto -lcurl -lusb-1.0"
           docker cp $arch:/data/data/com.termux/files/home/miasst_termux_$arch ./
         done
 
