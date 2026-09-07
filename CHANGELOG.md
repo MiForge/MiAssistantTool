@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.1
+- improvements
+
 ## 1.4.0
 - Complete rewrite in Python, now available as a PyPI CLI package
 - Added new commands (`format-cache`, `format-storage`, `format-data-storage`, `format-frp`, `wipe-data-storage`, `wipe-efs`)
