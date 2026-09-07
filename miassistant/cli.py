@@ -24,6 +24,8 @@ def prompt_choice():
 def _relaunch_via_termux_usb(choice):
     subprocess.run(["pkill", "-9", "-f", "tcp"])
 
+    console.print()
+    dots = 0
     while True:
         result = subprocess.run(["termux-usb", "-l"], capture_output=True, text=True)
         try:
@@ -31,15 +33,19 @@ def _relaunch_via_termux_usb(choice):
         except json.JSONDecodeError:
             devices = []
         if devices:
+            sys.stdout.write("\r" + " " * 40 + "\r")
+            sys.stdout.flush()
             device = devices[0]
             result = subprocess.run(["termux-usb", "-r", device], capture_output=True, text=True)
             if "granted" in result.stdout.lower():
                 break
-            console.print("\n[bold red]USB permission not granted.[/] Please allow access when prompted.")
+            console.print("[bold red]USB permission not granted.[/] Please allow access when prompted.")
         else:
-            for i in range(4):
-                console.print(f"\rNo USB devices connected {'.' * (i % 4)}", end="")
-                time.sleep(0.5)
+            line = f"No USB devices connected{'.' * (dots % 4)}"
+            sys.stdout.write("\r" + line.ljust(40))
+            sys.stdout.flush()
+            dots += 1
+            time.sleep(0.5)
 
     env = os.environ.copy()
     env["MIASSISTANT_CHOICE"] = str(choice)
