@@ -38,7 +38,7 @@ run_step "Installing termux-api" \
 "yes | pkg install termux-api"
 
 run_step "Installing miasst" \
-"pip install -U miassistant"
+"pip install -U miasst"
 
 
 echo -e "${G}✔ Installation completed successfully${N}\n"
