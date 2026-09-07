@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miasst"
-version = "1.4.0"
+version = "1.4.1"
 description = "Cross-platform CLI for Xiaomi Mi Assistant mode: flash, wipe, reboot"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -13,6 +13,7 @@ dependencies = [
     "requests",
     "pyaes",
     "rsa",
+    "rich",
 ]
 
 [project.urls]
