@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.2
+- Fixed garbled USB detection output
+
 ## 1.4.1
 - improvements
 
