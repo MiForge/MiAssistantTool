@@ -6,17 +6,19 @@ import time
 
 from miassistant import core
 
-def prompt_choice():
-    for n, (label, _) in core.ACTION_HANDLERS.items():
-        print(f"  {n} > {label}")
-    print()
+from rich.console import Console
+from rich.prompt import IntPrompt
 
-    while True:
-        raw = input("Choice: ").strip()
-        if not raw.isdigit() or int(raw) not in core.ACTION_HANDLERS:
-            print("Invalid choice, try again.")
-            continue
-        return int(raw)
+console = Console()
+
+def prompt_choice():
+    console.print()
+    for n, (label, _) in core.ACTION_HANDLERS.items():
+        console.print(f"  [bold color(208)]{n}[/]  {label}")
+    console.print()
+
+    choices = [str(n) for n in core.ACTION_HANDLERS]
+    return int(IntPrompt.ask("Choice", choices=choices, show_choices=False))
 
 
 def _relaunch_via_termux_usb(choice):
@@ -33,10 +35,10 @@ def _relaunch_via_termux_usb(choice):
             result = subprocess.run(["termux-usb", "-r", device], capture_output=True, text=True)
             if "granted" in result.stdout.lower():
                 break
-            print("\nUSB permission not granted. Please allow access when prompted.")
+            console.print("\n[bold red]USB permission not granted.[/] Please allow access when prompted.")
         else:
             for i in range(4):
-                print(f"\rNo USB devices connected {'.' * (i % 4)}", end="")
+                console.print(f"\rNo USB devices connected {'.' * (i % 4)}", end="")
                 time.sleep(0.5)
 
     env = os.environ.copy()
