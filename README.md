@@ -1,26 +1,53 @@
 <div align="center">
 
-  <a href="https://github.com/MiForge/MiUnlockTool/releases/latest"><img src="https://img.shields.io/badge/MiAssistantTool-%230070FF?style=flat&logo=xiaomi&logoColor=%23FF6900" alt="MiAssistantTool" style="width: 200px; vertical-align: middle;" /> </a><br>
+  <a href="https://github.com/MiForge/MiAssistantTool"><img src="https://img.shields.io/badge/MiAssistantTool-%230070FF?style=flat&logo=xiaomi&logoColor=%23FF6900" alt="MiAssistantTool" style="width: 200px; vertical-align: middle;" /></a><br>
 
-  It is compatible with all platforms.
+  Windows, macOS, Linux, and Termux.
 
-  <img src="https://img.shields.io/github/v/release/MiForge/MiAssistantTool?style=flat&label=Version&labelColor=black&color=brightgreen" alt="Version" /><br>
-  <br>
-  
+  [![Version](https://img.shields.io/pypi/v/miasst?label=Version&labelColor=black&color=brightgreen)](https://pypi.org/project/miasst/)
+  [![Changelog](https://img.shields.io/badge/Changelog-blue?style=flat)](CHANGELOG.md)
+  [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+  ___
+
 </div>
 
+In Mi Assistant mode, without unlocking the bootloader:
+
+- Read Info
+- Flash Official Recovery ROM
+- ROMs that can be flashed
+- Format Data / Cache / Storage / Data + Storage / FRP
+- Wipe Data Storage / EFS
+- Reboot / Reboot to recovery / fastboot / bootloader
+- Shutdown
+
 ___
 
-in Mi-Assistant mode, without unlocking bootloader:
+### Dependencies
 
-- Read-Info
-- Flash-Official-Recovery-ROM
-- Format-Data
+* Linux: `sudo apt install libusb-1.0-0`
+* macOS: `brew install libusb`
+* Termux: `pkg install libusb`
+* Windows: No extra steps required (uses standard USB drivers).
 
-___
+### Install
 
-### [Download ](https://github.com/MiForge/MiAssistantTool/releases/latest)
+```bash
+pip install miasst
+```
 
-### Building for other architectures
+### Usage
 
-Not every architecture has a prebuilt binary. To build for yours, clone the repo and compile `miasst.c` + `tiny-json/tiny-json.c`, linking against `libusb-1.0`, `ssl`, `crypto`, and `curl`. See [`.github/workflows/build.yml`](.github/workflows/build.yml) for the exact commands used for each supported platform.
+```bash
+miasst
+```
+
+## Notes
+
+On Termux (without root) you'll need the [Termux:API](https://github.com/termux/termux-api/releases/latest) app, and `pkg install termux-api`.
+
+### Quick Installation (for Termux):
+
+```sh
+curl -sS https://raw.githubusercontent.com/MiForge/MiAssistantTool/main/install.sh | bash
+```

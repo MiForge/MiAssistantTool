@@ -1,0 +1,47 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+set -e
+
+R='\033[0;31m'
+G='\033[0;32m'
+I='\033[0;90m' 
+N='\033[0m'
+
+run_step() {
+    local msg="$1"
+    local cmd="$2"
+
+    echo -e "${I}[..]${N} $msg..."
+
+    if eval "$cmd" > /dev/null 2>&1; then
+        echo -e "     └─> ${G}[SUCCESS]${N}\n"
+    else
+        echo -e "     └─> ${R}[FAILED]${N}"
+        echo -e "${R}Error occurred during: $msg${N}\n"
+        exit 1
+    fi
+}
+
+echo
+
+
+run_step "Updating System & Fixing Broken Packages" \
+"yes | apt --fix-broken install && yes | apt update && yes | apt upgrade"
+
+run_step "Installing python-pip" \
+"yes | pkg install python-pip"
+
+run_step "Installing libusb" \
+"yes | pkg install libusb"
+
+run_step "Installing termux-api" \
+"yes | pkg install termux-api"
+
+run_step "Installing miasst" \
+"pip install -U miassistant"
+
+
+echo -e "${G}✔ Installation completed successfully${N}\n"
+
+echo -e "Run command: ${G}miasst${N}"
+echo ""

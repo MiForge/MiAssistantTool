@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4
+- Complete rewrite in Python, now available as a PyPI CLI package
+- Added new commands (`format-cache`, `format-storage`, `format-data-storage`, `format-frp`, `wipe-data-storage`, `wipe-efs`)
+- Added reading for new device details (`Mi Token`, `Carrier`, `Recovery Version`)
+- General improvements and bug fixes
+
 ## 1.3
 - Fixed Windows crashes and data corruption when flashing large ROMs (#7, PR #10, thanks @MaChInEgUn3)
 - Windows release is now a zip with the .exe and its required DLLs, instead of a bare .exe (#5)
