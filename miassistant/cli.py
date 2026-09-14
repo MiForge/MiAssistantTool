@@ -4,7 +4,7 @@ import subprocess
 import sys
 import time
 
-from miassistant import core
+from miassistant import core, deps
 
 from rich.console import Console
 from rich.prompt import IntPrompt
@@ -54,6 +54,7 @@ def _relaunch_via_termux_usb(choice):
 
 
 def main():
+    deps.ensure_libusb()
     preset_choice = os.environ.get("MIASSISTANT_CHOICE")
     choice = int(preset_choice) if preset_choice else prompt_choice()
 

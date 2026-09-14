@@ -23,12 +23,11 @@ In Mi Assistant mode, without unlocking the bootloader:
 
 ___
 
-### Dependencies
+### Requirements
 
-* Linux: `sudo apt install libusb-1.0-0`
-* macOS: `brew install libusb`
-* Termux: `pkg install libusb`
-* Windows: No extra steps required (uses standard USB drivers).
+Python >=3.9
+
+___
 
 ### Install
 
@@ -44,7 +43,7 @@ miasst
 
 ## Notes
 
-On Termux (without root) you'll need the [Termux:API](https://github.com/termux/termux-api/releases/latest) app, and `pkg install termux-api`.
+On Termux (without root) you'll need the [Termux:API](https://github.com/termux/termux-api/releases/latest) app installed.
 
 ### Quick Installation (for Termux):
 

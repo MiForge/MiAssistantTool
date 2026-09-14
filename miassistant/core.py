@@ -1,5 +1,6 @@
 import ctypes
 import json
+import platform
 import base64
 import re
 import urllib.parse
@@ -12,6 +13,14 @@ import os
 import hashlib
 import pyaes
 from rsa import PublicKey
+
+_BACKEND = None
+if platform.system() == "Windows":
+    try:
+        import libusb_package
+        _BACKEND = usb.backend.libusb1.get_backend(find_library=libusb_package.find_library)
+    except ImportError:
+        pass
 
 B_INTERFACE_CLASS = 0xFF
 B_INTERFACE_SUBCLASS = 0x42
@@ -149,7 +158,7 @@ def connect_termux_nonroot():
 
 def connect_normal():
     try:
-        dev_list = list(usb.core.find(find_all=True))
+        dev_list = list(usb.core.find(find_all=True, backend=_BACKEND))
     except usb.core.USBError:
         return None
 

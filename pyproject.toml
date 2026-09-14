@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miasst"
-version = "1.4.2"
+version = "1.4.3"
 description = "Cross-platform CLI for Xiaomi Mi Assistant mode: flash, wipe, reboot"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "pyusb",
     "requests",
     "pyaes",
     "rsa",
     "rich",
+    "libusb_package; sys_platform == 'win32'",
 ]
 
 [project.urls]
