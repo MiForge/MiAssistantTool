@@ -10,6 +10,21 @@ from miassistant import core
 
 _MARKER = os.path.expanduser("~/.miasst_deps_ok")
 
+PKGS = {
+    "apt-get": "libusb-1.0-0",
+    "dnf": "libusb1",
+    "yum": "libusb1",
+    "pacman": "libusb",
+    "zypper": "libusb-1_0-0",
+}
+
+UDEV_PATH = "/etc/udev/rules.d/51-miasst.rules"
+UDEV_RULES = (
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="2717", MODE="0666", GROUP="plugdev"\n'
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="05c6", MODE="0666", GROUP="plugdev"\n'
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", GROUP="plugdev"\n'
+)
+
 
 def _run(cmd):
     if not shutil.which(cmd[0]):
@@ -57,32 +72,58 @@ def _ensure_termux():
     return ok
 
 
-def _ensure_unix():
-    if usb.backend.libusb1.get_backend():
-        return True
-
-    system = platform.system()
-    if system == "Darwin":
+def _install_libusb_unix():
+    if platform.system() == "Darwin":
         if not shutil.which("brew"):
             print("Homebrew not found. Install libusb manually: brew install libusb")
             return False
-        _run(["brew", "install", "libusb"])
+        return _run(["brew", "install", "libusb"])
 
-    elif shutil.which("apt-get"):
-        cmd = ["apt-get", "install", "-y", "libusb-1.0-0"]
-        if os.geteuid() == 0:
-            _run(cmd)
-        elif shutil.which("sudo"):
-            _run(["sudo"] + cmd)
-        else:
-            print("Need root to install libusb. Try manually: sudo apt-get install libusb-1.0-0")
+    for mgr, pkg in PKGS.items():
+        if not shutil.which(mgr):
+            continue
+        cmd = [mgr, "-S", "--noconfirm", pkg] if mgr == "pacman" else [mgr, "install", "-y", pkg]
+        if os.geteuid() != 0:
+            if not shutil.which("sudo"):
+                print(f"Need root to install {pkg}. Try manually: sudo {' '.join(cmd)}")
+                return False
+            cmd = ["sudo"] + cmd
+        return _run(cmd)
+
+    print("No supported package manager found. Install libusb manually for your distro.")
+    return False
+
+
+def _ensure_udev():
+    if platform.system() != "Linux" or os.path.exists("/data/data/com.termux"):
+        return
+    if os.geteuid() != 0 and not shutil.which("sudo"):
+        return
+
+    try:
+        if open(UDEV_PATH).read() == UDEV_RULES:
+            return
+    except OSError:
+        pass
+
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    print("Writing udev rules ->", UDEV_PATH)
+    p = subprocess.Popen(prefix + ["tee", UDEV_PATH], stdin=subprocess.PIPE, text=True, stdout=subprocess.DEVNULL)
+    p.communicate(UDEV_RULES)
+    subprocess.run(prefix + ["udevadm", "control", "--reload-rules"])
+    subprocess.run(prefix + ["udevadm", "trigger"])
+
+
+def _ensure_unix():
+    if not usb.backend.libusb1.get_backend():
+        if not _install_libusb_unix():
+            return False
+        if not usb.backend.libusb1.get_backend():
+            print("Installed but still not detected. Try manually and rerun miasst.")
             return False
 
-    else:
-        print("No supported package manager found. Install libusb manually for your distro.")
-        return False
-
-    return bool(usb.backend.libusb1.get_backend())
+    _ensure_udev()
+    return True
 
 
 def ensure_libusb():

@@ -1,7 +1,8 @@
 # Changelog
 
 ## 1.4.3
-- Auto-install missing dependencies on first run: `libusb` (apt/brew/pkg) and `termux-api` (pkg, non-root Termux)
+- Auto-install missing dependencies on first run: `libusb` (apt/dnf/yum/pacman/zypper on Linux, brew on macOS, pkg on Termux) and `termux-api` (pkg, non-root Termux)
+- Writes udev rules for Xiaomi/Qualcomm/Google USB vendor IDs on desktop Linux so device access works without root
 - Windows now bundles `libusb` via the `libusb_package` pip dependency instead of relying on a system-provided DLL
 - Requires Python >=3.9 (was >=3.8), needed for `libusb_package`
 
