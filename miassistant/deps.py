@@ -3,7 +3,7 @@ import platform
 import shutil
 import subprocess
 import sys
-
+from pathlib import Path
 import usb.backend.libusb1
 
 from miassistant import core
@@ -33,6 +33,23 @@ def _run(cmd):
     subprocess.run(cmd)
     return True
 
+def check_termux():
+    config_file = Path.home() / ".termux" / "termux.properties"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_content = config_file.read_text(encoding="utf-8") if config_file.exists() else ""
+    if "allow-external-apps = true" not in existing_content:
+        with open(config_file, "a", encoding="utf-8") as f:
+            f.write("\nallow-external-apps = true\n")
+        subprocess.run(["termux-reload-settings"], check=False)
+
+    result = subprocess.run(
+        ["cmd", "package", "list", "packages", "--user", "0", "com.termux.api"],
+        capture_output=True,
+        text=True,
+    )
+    if "package:com.termux.api" not in result.stdout:
+        print("\n✗ com.termux.api is not installed!\n")
+        raise SystemExit(1)
 
 def _ensure_windows():
     if core._BACKEND is not None:
@@ -54,6 +71,7 @@ def _ensure_windows():
 
 
 def _ensure_termux():
+    check_termux()
     ok = True
 
     lib_path = f"{os.environ.get('PREFIX', '')}/lib/libusb-1.0.so"
