@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.4
+- On Termux: auto-enable `allow-external-apps = true` and verify that the `com.termux.api` app is installed
+
 ## 1.4.3
 - Auto-install missing dependencies on first run: `libusb` (apt/dnf/yum/pacman/zypper on Linux, brew on macOS, pkg on Termux) and `termux-api` (pkg, non-root Termux)
 - Writes udev rules for Xiaomi/Qualcomm/Google USB vendor IDs on desktop Linux so device access works without root
