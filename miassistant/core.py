@@ -502,6 +502,8 @@ def flash_rom():
                         print("MD5 mismatch between local file and server response.")
                         validate3 = r3["PkgRom"]["Validate"]
                         start_sideload(transport, path, validate3)
+                else:
+                    start_sideload(transport, path, v['Validate'])
                 break
         else:
             valid = []
