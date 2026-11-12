@@ -1,7 +1,7 @@
 # Changelog
 
 ## 1.4.5
-- Fix silent exit when flashing the currently installed ROM
+- Fix #13 silent exit when flashing the currently installed ROM
 
 ## 1.4.4
 - On Termux: auto-enable `allow-external-apps = true` and verify that the `com.termux.api` app is installed
