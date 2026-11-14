@@ -10,6 +10,8 @@ import usb.util
 import usb.backend.libusb1
 import struct
 import os
+import sys
+import time
 import hashlib
 import pyaes
 from rsa import PublicKey
@@ -35,7 +37,12 @@ ADB_MAX_DATA = 1024 * 1024
 ADB_SIDELOAD_CHUNK_SIZE = 1024 * 64
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
 USB_TIMEOUT_MS = 3000
+LIBUSB_ERROR_NO_DEVICE = -4
+SIDELOAD_IDLE_LIMIT = 900
+MAX_CONSECUTIVE_WRITE_ERRORS = 20
+HTTP_TIMEOUT = (10, 30)
 
+_banner = {}
 
 class EPDesc(ctypes.Structure):
     _fields_ = [
@@ -114,7 +121,7 @@ def find_adb_endpoints_raw(lib, dev):
 def connect_termux_nonroot():
     fd = os.environ.get("TERMUX_USB_FD")
     if fd is None:
-        exit("\n\nWithout root (termux-usb must be used)\n\n")
+        sys.exit("\n\nWithout root (termux-usb must be used)\n\n")
     fd = int(fd)
 
     m = usb.backend.libusb1
@@ -132,8 +139,9 @@ def connect_termux_nonroot():
     lib.libusb_wrap_sys_device.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.POINTER(ctypes.c_void_p)]
     lib.libusb_wrap_sys_device.restype = ctypes.c_int
     handle = ctypes.c_void_p()
-    if lib.libusb_wrap_sys_device(ctx, fd, ctypes.byref(handle)) != 0 or not handle.value:
-        exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
+    rc = lib.libusb_wrap_sys_device(ctx, fd, ctypes.byref(handle))
+    if rc != 0 or not handle.value:
+        sys.exit(f"\n\ndevice is not connected, or not in mi assistant mode (libusb error {rc})\n\n")
 
     lib.libusb_get_device.argtypes = [ctypes.c_void_p]
     lib.libusb_get_device.restype = ctypes.c_void_p
@@ -141,7 +149,7 @@ def connect_termux_nonroot():
 
     ep_out, ep_in = find_adb_endpoints_raw(lib, dev)
     if ep_out is None:
-        exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
+        sys.exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
 
     lib.libusb_claim_interface.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.libusb_claim_interface.restype = ctypes.c_int
@@ -191,7 +199,7 @@ def connect_normal():
 def connect():
     transport = connect_termux_nonroot() if is_nonroot_termux() else connect_normal()
     if not transport:
-        exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
+        sys.exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
     return transport
 
 
@@ -199,11 +207,18 @@ class DeviceWriteError(Exception):
     pass
 
 
+def _pyusb_no_device(error):
+    return (getattr(error, "backend_error_code", None) == LIBUSB_ERROR_NO_DEVICE
+            or getattr(error, "errno", None) == 19)
+
+
 def usb_write(transport, data):
     if transport["kind"] == "pyusb":
         try:
             transport["out_ep"].write(data, timeout=USB_TIMEOUT_MS)
         except usb.core.USBError as e:
+            if _pyusb_no_device(e):
+                raise DeviceDisconnected(str(e))
             raise DeviceWriteError(str(e))
     else:
         buf = ctypes.create_string_buffer(data, len(data))
@@ -211,6 +226,8 @@ def usb_write(transport, data):
         r = transport["lib"].libusb_bulk_transfer(
             transport["handle"], transport["ep_out"], buf, len(data), ctypes.byref(n), USB_TIMEOUT_MS
         )
+        if r == LIBUSB_ERROR_NO_DEVICE:
+            raise DeviceDisconnected("device disconnected")
         if r != 0:
             raise DeviceWriteError(f"libusb_bulk_transfer write failed (code {r})")
 
@@ -219,13 +236,17 @@ def usb_read(transport, size):
     if transport["kind"] == "pyusb":
         try:
             return bytes(transport["in_ep"].read(size, timeout=USB_TIMEOUT_MS))
-        except usb.core.USBError:
+        except usb.core.USBError as e:
+            if _pyusb_no_device(e):
+                raise DeviceDisconnected(str(e))
             return b""
     buf = ctypes.create_string_buffer(size)
     n = ctypes.c_int(0)
     r = transport["lib"].libusb_bulk_transfer(
         transport["handle"], transport["ep_in"], buf, size, ctypes.byref(n), USB_TIMEOUT_MS
     )
+    if r == LIBUSB_ERROR_NO_DEVICE:
+        raise DeviceDisconnected("device disconnected")
     return buf.raw[: n.value] if r == 0 else b""
 
 
@@ -240,6 +261,10 @@ class DeviceTimeout(Exception):
     pass
 
 
+class DeviceDisconnected(DeviceTimeout):
+    pass
+
+
 def read_packet(transport):
     header = usb_read(transport, 24)
     if len(header) < 24:
@@ -248,12 +273,17 @@ def read_packet(transport):
     data = usb_read(transport, length) if length else b""
     return cmd, arg0, arg1, data
 
+def parse_banner(data):
+    text = data.decode(errors="ignore").rstrip("\x00")
+    props = text.partition("::")[2]
+    return dict(item.split("=", 1) for item in props.split(";") if "=" in item)
 
 def adb_connect(transport):
     send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
     _, _, _, data = read_packet(transport)
     if not data.startswith(b"sideload::"):
-        exit("device not connected, or not in Mi Assistant mode")
+        sys.exit("device not connected, or not in Mi Assistant mode")
+    return parse_banner(data)
 
 
 def adb_cmd(transport, command):
@@ -271,13 +301,25 @@ def start_sideload(transport, file_path, validate):
 
     total_sent = 0
     final_message = ""
+    last_activity = time.monotonic()
+    write_errors = 0
+    announced_wait = False
+    served_blocks = set()
+    last_pct = -1
 
     with open(file_path, "rb") as f:
         while True:
             try:
                 cmd, arg0, arg1, data = read_packet(transport)
+            except DeviceDisconnected:
+                sys.exit("\n\nError: the device was disconnected during the transfer.\n\n")
             except (DeviceTimeout, DeviceWriteError):
+                idle = time.monotonic() - last_activity
+                if idle > SIDELOAD_IDLE_LIMIT:
+                    sys.exit(f"\n\nError: no response from the device for {int(idle)} seconds. Aborting.\n\n")
+                time.sleep(0.1)
                 continue
+            last_activity = time.monotonic()
 
             if len(data) > 8:
                 final_message = data.decode(errors="ignore")
@@ -301,12 +343,27 @@ def start_sideload(transport, file_path, validate):
             try:
                 send_packet(transport, ADB_WRTE, arg1, arg0, chunk)
                 send_packet(transport, ADB_OKAY, arg1, arg0)
-            except DeviceWriteError:
+                write_errors = 0
+            except DeviceDisconnected:
+                sys.exit("\n\nError: the device was disconnected during the transfer.\n\n")
+            except DeviceWriteError as e:
+                write_errors += 1
+                if write_errors >= MAX_CONSECUTIVE_WRITE_ERRORS:
+                    sys.exit(f"\n\nError: repeated USB write failures ({e}). Aborting.\n\n")
                 continue
-            total_sent += to_write
+
+            if block not in served_blocks:
+                served_blocks.add(block)
+                total_sent += to_write
 
             pct = min(100, int(total_sent * 100 / file_size))
-            print(f"\rFlashing in progress ... {pct}/100%", end="", flush=True)
+            if pct != last_pct:
+                last_pct = pct
+                print(f"\rTransferring in progress ... {pct}/100%", end="", flush=True)
+            if pct >= 100 and not announced_wait:
+                announced_wait = True
+                print("\nTransfer finished. Waiting for the device to verify/install "
+                      "(this can take several minutes) ...", flush=True)
 
     print(f"\n\n{final_message}\n")
     return final_message
@@ -316,16 +373,15 @@ _transport = None
 _connected = False
 _info = None
 
-
 def get_transport():
     global _transport, _connected
     if _transport is None:
         _transport = connect()
     if not _connected:
         try:
-            adb_connect(_transport)
+            _banner.update(adb_connect(_transport))
         except DeviceTimeout:
-            exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
+            sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
         _connected = True
     return _transport
 
@@ -349,13 +405,15 @@ def get_info():
                 "recoveryversion": adb_cmd(transport, "getrecoveryversion:"),
             }
         except DeviceTimeout:
-            exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
+            sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
     return _info
-
 
 
 def read_info():
     info = get_info()
+    print(f"ro.product.model: {_banner.get('ro.product.model', 'unknown')}")
+    print(f"ro.product.device: {_banner.get('ro.product.device', 'unknown')}")
+    print(f"ro.product.name: {_banner.get('ro.product.name', 'unknown')}")
     print(f"\nDevice: {info['device']}")
     print(f"Version: {info['version']}")
     print(f"Serial Number: {info['sn']}")
@@ -400,13 +458,20 @@ def _validate_request(info, md5):
     enc = _aes_cbc_encrypt(key, iv, body)
     q = urllib.parse.quote(base64.b64encode(enc).decode())
 
-    resp = requests.post(
-        "http://update.miui.com/updates/miotaV3.php",
-        data=f"q={q}&t=&s=1",
-        headers={"User-Agent": "MiTunes_UserAgent_v3.0", "Content-Type": "application/x-www-form-urlencoded"},
-    )
-    dec = _aes_cbc_decrypt(key, iv, base64.b64decode(resp.text.strip()))
-    result = json.loads(_pkcs7_unpad(dec).decode("utf-8", errors="ignore"))
+    try:
+        resp = requests.post(
+            "http://update.miui.com/updates/miotaV3.php",
+            data=f"q={q}&t=&s=1",
+            headers={"User-Agent": "MiTunes_UserAgent_v3.0", "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        dec = _aes_cbc_decrypt(key, iv, base64.b64decode(resp.text.strip()))
+        result = json.loads(_pkcs7_unpad(dec).decode("utf-8", errors="ignore"))
+    except requests.RequestException as e:
+        sys.exit(f"\n\nNetwork error while contacting update.miui.com: {e}\n\n")
+    except ValueError:
+        sys.exit("\n\nUnexpected response from update.miui.com.\n\n")
     return result
 
 def validate_decrypt(validate):
@@ -439,11 +504,16 @@ NWzHCPfAfKQQn1VqXthiwxTZ25i4FYbuySwZ7xfXhqJwcLKuxN9uRCHBG8KV9V5T
 def file_info():
 
     while True:
-        file_path = input("Enter .zip file path: ")
+        try:
+            raw = input("Enter .zip file path: ")
+        except EOFError:
+            sys.exit("\n\nNo input available (stdin closed).\n\n")
+        file_path = os.path.expanduser(raw.strip().strip("\"'"))
         if os.path.isfile(file_path) and file_path.lower().endswith(".zip"):
             break
         print("Invalid path or file is not a .zip. Try again.")
 
+    print("Calculating checksums ...", flush=True)
     md5_hash = hashlib.md5()
     sha1_hash = hashlib.sha1()
     with open(file_path, "rb") as f:
@@ -465,7 +535,7 @@ def extract_validate(data):
                 md5 = obj.get('md5')
                 if md5 not in seen:
                     seen.add(md5)
-                    result[parent] = {'md5': obj.get('md5'), 'Validate': obj['Validate']}
+                    result[parent] = {'md5': obj.get('md5'), 'Validate': obj['Validate'], 'Erase': obj.get('Erase')}
             for k, v in obj.items():
                 walk(v, k)
         elif isinstance(obj, list):
@@ -473,6 +543,27 @@ def extract_validate(data):
                 walk(item, parent)
     walk(data)
     return result
+
+def _confirm(question, expected="YES"):
+    try:
+        answer = input(f"{question}\nType {expected} to continue: ")
+    except EOFError:
+        return False
+    return answer.strip() == expected
+
+
+def _confirm_erase(erase):
+    if str(erase) == "0":
+        return True
+    if str(erase) == "1":
+        note = "NOTICE: Data will be erased during flashing."
+    else:
+        note = "NOTICE: Could not determine whether this package erases data; assume it will."
+    if _confirm(note):
+        return True
+    print("Operation cancelled.")
+    return False
+
 
 def flash_rom():
     path, md5, sha1 = file_info()
@@ -487,8 +578,8 @@ def flash_rom():
         if decrypted.get("SHA1") != sha1:
             print("SHA1 mismatch between local file and server response.")
             return
-        if r["PkgRom"]["Erase"] == 1:
-            input("NOTICE: Data will be erased during flashing.\nPress Enter to continue...")
+        if not _confirm_erase(r["PkgRom"].get("Erase")):
+            return
         start_sideload(transport, path, validate)
     else:
         r2 = _validate_request(info, "")
@@ -501,9 +592,13 @@ def flash_rom():
                     if "PkgRom" in r3 and "Validate" in r3["PkgRom"]:
                         print("MD5 mismatch between local file and server response.")
                         validate3 = r3["PkgRom"]["Validate"]
-                        start_sideload(transport, path, validate3)
+                        if _confirm_erase(r3["PkgRom"].get("Erase")):
+                            start_sideload(transport, path, validate3)
+                    else:
+                        print("The server did not return a flashable package for this file.")
                 else:
-                    start_sideload(transport, path, v['Validate'])
+                    if _confirm_erase(v.get('Erase')):
+                        start_sideload(transport, path, v['Validate'])
                 break
         else:
             valid = []
@@ -544,26 +639,33 @@ def send_simple(command):
     transport = get_transport()
     print(adb_cmd(transport, command))
 
+def send_destructive(command, warning):
+    print(f"\n{warning}")
+    if not _confirm("This cannot be undone."):
+        print("Operation cancelled.")
+        return
+    send_simple(command)
+
 def format_data():
-    send_simple("format-data:")
+    send_destructive("format-data:", "This will erase all user data on the device.")
 
 def format_cache():
     send_simple("format-cache:")
 
 def format_storage():
-    send_simple("format-storage:")
+    send_destructive("format-storage:", "This will erase the internal storage (photos, files).")
 
 def format_data_storage():
-    send_simple("format-data-storage:")
+    send_destructive("format-data-storage:", "This will erase user data AND internal storage.")
 
 def format_frp():
-    send_simple("format-frp:")
+    send_destructive("format-frp:", "This will erase the FRP (factory reset protection) partition.")
 
 def wipe_data_storage():
-    send_simple("wipe-data-storage:")
+    send_destructive("wipe-data-storage:", "This will wipe user data and internal storage.")
 
 def wipe_efs():
-    print("\n⚠️ [WARNING]: If you are a normal user and don't know what this means, DO NOT use this command!")
+    print("\n[WARNING]: If you are a normal user and don't know what this means, DO NOT use this command!")
     print("Wiping EFS will permanently break your phone's network and delete your IMEI.")
     confirm = input("Type 'YES' only if you are an expert and know exactly what you are doing: ")  
     if confirm == "YES":
@@ -596,6 +698,7 @@ def reboot_bootloader():
 
 def shutdown():
     send_disconnecting("shutdown:", "shutting down")
+
 
 ACTION_HANDLERS = {
     1: ("Read Info", read_info),
