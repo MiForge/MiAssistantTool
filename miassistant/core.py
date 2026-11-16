@@ -38,6 +38,9 @@ ADB_SIDELOAD_CHUNK_SIZE = 1024 * 64
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
 USB_TIMEOUT_MS = 3000
 LIBUSB_ERROR_NO_DEVICE = -4
+LIBUSB_ERROR_NOT_FOUND = -5
+LIBUSB_ERROR_TIMEOUT = -7
+MAX_CONSECUTIVE_IO_ERRORS = 10
 SIDELOAD_IDLE_LIMIT = 900
 MAX_CONSECUTIVE_WRITE_ERRORS = 20
 HTTP_TIMEOUT = (10, 30)
@@ -212,6 +215,12 @@ def _pyusb_no_device(error):
             or getattr(error, "errno", None) == 19)
 
 
+def _pyusb_is_timeout(error):
+    timeout_error = getattr(usb.core, "USBTimeoutError", None)
+    return ((timeout_error is not None and isinstance(error, timeout_error))
+            or getattr(error, "backend_error_code", None) == LIBUSB_ERROR_TIMEOUT
+            or getattr(error, "errno", None) == 110)
+
 def usb_write(transport, data):
     if transport["kind"] == "pyusb":
         try:
@@ -239,14 +248,18 @@ def usb_read(transport, size):
         except usb.core.USBError as e:
             if _pyusb_no_device(e):
                 raise DeviceDisconnected(str(e))
-            return b""
+            if _pyusb_is_timeout(e):
+                return b""
+            raise DeviceIOError(str(e))
     buf = ctypes.create_string_buffer(size)
     n = ctypes.c_int(0)
     r = transport["lib"].libusb_bulk_transfer(
         transport["handle"], transport["ep_in"], buf, size, ctypes.byref(n), USB_TIMEOUT_MS
     )
-    if r == LIBUSB_ERROR_NO_DEVICE:
+    if r in (LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NOT_FOUND):
         raise DeviceDisconnected("device disconnected")
+    if r not in (0, LIBUSB_ERROR_TIMEOUT):
+        raise DeviceIOError(f"libusb read failed (code {r})")
     return buf.raw[: n.value] if r == 0 else b""
 
 
@@ -265,6 +278,9 @@ class DeviceDisconnected(DeviceTimeout):
     pass
 
 
+class DeviceIOError(DeviceTimeout):
+    pass
+
 def read_packet(transport):
     header = usb_read(transport, 24)
     if len(header) < 24:
@@ -278,16 +294,18 @@ def parse_banner(data):
     props = text.partition("::")[2]
     return dict(item.split("=", 1) for item in props.split(";") if "=" in item)
 
+
 def adb_connect(transport):
     send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
-    _, _, _, data = read_packet(transport)
-    if not data.startswith(b"sideload::"):
-        sys.exit("device not connected, or not in Mi Assistant mode")
-    return parse_banner(data)
+    for _ in range(10):
+        _, _, _, data = read_packet(transport)
+        if data.startswith(b"sideload::"):
+            return parse_banner(data)
+    sys.exit("device did not send a valid sideload banner")
 
 
 def adb_cmd(transport, command):
-    send_packet(transport, ADB_OPEN, 1, 0, command.encode())
+    send_packet(transport, ADB_OPEN, 1, 0, command.encode() + b"\x00")
     read_packet(transport)
     _, _, _, resp = read_packet(transport)
     read_packet(transport)
@@ -297,7 +315,8 @@ def adb_cmd(transport, command):
 
 def start_sideload(transport, file_path, validate):
     file_size = os.path.getsize(file_path)
-    send_packet(transport, ADB_OPEN, 1, 0, f"sideload-host:{file_size}:{ADB_SIDELOAD_CHUNK_SIZE}:{validate}:0".encode())
+    service = (f"sideload-host:{file_size}:{ADB_SIDELOAD_CHUNK_SIZE}:{validate}:0").encode() + b"\x00"
+    send_packet(transport, ADB_OPEN, 1, 0, service)
 
     total_sent = 0
     final_message = ""
@@ -306,6 +325,7 @@ def start_sideload(transport, file_path, validate):
     announced_wait = False
     served_blocks = set()
     last_pct = -1
+    io_errors = 0
 
     with open(file_path, "rb") as f:
         while True:
@@ -313,12 +333,22 @@ def start_sideload(transport, file_path, validate):
                 cmd, arg0, arg1, data = read_packet(transport)
             except DeviceDisconnected:
                 sys.exit("\n\nError: the device was disconnected during the transfer.\n\n")
+            except DeviceIOError as e:
+                io_errors += 1
+                if io_errors >= MAX_CONSECUTIVE_IO_ERRORS:
+                    if announced_wait:
+                        sys.exit(f"\n\nThe device stopped responding after the transfer finished ({e}). "
+                                 "It probably left sideload mode; check the phone screen and the installed version.\n\n")
+                    sys.exit(f"\n\nError: repeated USB read errors ({e}). Aborting.\n\n")
+                time.sleep(0.1)
+                continue
             except (DeviceTimeout, DeviceWriteError):
                 idle = time.monotonic() - last_activity
                 if idle > SIDELOAD_IDLE_LIMIT:
                     sys.exit(f"\n\nError: no response from the device for {int(idle)} seconds. Aborting.\n\n")
                 time.sleep(0.1)
                 continue
+            io_errors = 0
             last_activity = time.monotonic()
 
             if len(data) > 8:
