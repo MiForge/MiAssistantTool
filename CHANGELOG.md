@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.7
+- Minor fixes and improvements
+
 ## 1.4.6
 - Termux: fix "Flash Official Recovery ROM" looking stuck, keep the phone awake while flashing
 - Flashing now stops with a clear error instead of hanging when the device disconnects
