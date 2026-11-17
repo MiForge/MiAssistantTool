@@ -38,7 +38,7 @@ ADB_VERSION = 0x01000001
 ADB_MAX_DATA = 1024 * 1024
 ADB_SIDELOAD_CHUNK_SIZE = 1024 * 64
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
-USB_TIMEOUT_MS = 30000
+USB_TIMEOUT_MS = 8000
 LIBUSB_ERROR_NO_DEVICE = -4
 LIBUSB_ERROR_NOT_FOUND = -5
 LIBUSB_ERROR_TIMEOUT = -7
@@ -288,6 +288,8 @@ def read_packet(transport):
     if len(header) < 24:
         raise DeviceTimeout()
     cmd, arg0, arg1, length, checksum, magic = struct.unpack("<6I", header)
+    if magic != (cmd ^ 0xFFFFFFFF):
+        raise DeviceIOError(f"Invalid ADB packet magic (cmd={cmd:#x})")
     data = usb_read(transport, length) if length else b""
     return cmd, arg0, arg1, data
 
@@ -300,18 +302,49 @@ def parse_banner(data):
 def adb_connect(transport):
     send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
     for _ in range(10):
-        _, _, _, data = read_packet(transport)
-        if data.startswith(b"sideload::"):
-            return parse_banner(data)
+        try:
+            _, _, _, data = read_packet(transport)
+            if data.startswith(b"sideload::"):
+                return parse_banner(data)
+        except DeviceTimeout:
+            continue
     sys.exit("device did not send a valid sideload banner")
 
 
 def adb_cmd(transport, command):
     send_packet(transport, ADB_OPEN, 1, 0, command.encode() + b"\x00")
-    read_packet(transport)
-    _, _, _, resp = read_packet(transport)
-    read_packet(transport)
-    text = resp.decode(errors="ignore")
+
+    response = None
+    closed = False
+
+    for _ in range(12):
+        try:
+            cmd, arg0, arg1, data = read_packet(transport)
+        except DeviceTimeout:
+            continue
+
+        if cmd == ADB_CLSE:
+            closed = True
+            break
+
+        if cmd == ADB_OKAY:
+            send_packet(transport, ADB_OKAY, arg1, arg0)
+            continue
+
+        if cmd == ADB_WRTE and data:
+            response = data
+            send_packet(transport, ADB_OKAY, arg1, arg0)
+            continue
+
+        if data and response is None:
+            response = data
+
+    if response is None:
+        if closed:
+            raise DeviceIOError(f"Channel closed before receiving response for: {command}")
+        raise DeviceTimeout(f"No response received for command: {command}")
+
+    text = response.decode(errors="ignore").rstrip("\x00")
     return text[:-1] if text.endswith("\n") else text
 
 
@@ -353,12 +386,20 @@ def start_sideload(transport, file_path, validate):
             io_errors = 0
             last_activity = time.monotonic()
 
+            if cmd == ADB_CLSE:
+                if final_message:
+                    break
+                if data:
+                    final_message = data.decode(errors="ignore")
+                break
+
             if len(data) > 8:
                 final_message = data.decode(errors="ignore")
                 break
 
             if cmd == ADB_OKAY:
                 send_packet(transport, ADB_OKAY, arg1, arg0)
+                continue
 
             if cmd != ADB_WRTE:
                 continue
@@ -438,6 +479,8 @@ def get_info():
             }
         except DeviceTimeout:
             sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
+        except DeviceIOError as e:
+            sys.exit(f"\n\nError while reading device info: {e}\n\n")
     return _info
 
 
@@ -583,10 +626,11 @@ def _confirm_erase(erase):
         note = "NOTICE: Data will be erased during flashing."
     else:
         note = "NOTICE: Could not determine whether this package erases data; assume it will."
-    if _confirm(note):
-        return True
-    print("Operation cancelled.")
-    return False
+    print(f"\n{note}")
+    if input("This cannot be undone.\nType YES to continue: ").strip() != "YES":
+        print("Operation cancelled.")
+        return False
+    return True
 
 
 def flash_rom():
@@ -706,6 +750,8 @@ def send_disconnecting(command, verb):
         print(run_adb(command))
     except DeviceTimeout:
         print(f"Device is {verb} (connection closed as expected).")
+    except DeviceIOError:
+        print(f"Device is {verb} (connection closed as expected).")
 
 def reboot():
     send_disconnecting("reboot:", "rebooting")
@@ -721,9 +767,6 @@ def reboot_bootloader():
 
 def shutdown():
     send_disconnecting("shutdown:", "shutting down")
-
-def wipe_data_storage():
-    guarded_format("This will wipe user data and internal storage.", "wipe-data-storage:")
 
 
 ACTION_HANDLERS = {
