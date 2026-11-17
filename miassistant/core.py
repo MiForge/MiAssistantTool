@@ -32,11 +32,13 @@ ADB_CNXN = int.from_bytes(b"CNXN", "little")
 ADB_OPEN = int.from_bytes(b"OPEN", "little")
 ADB_OKAY = int.from_bytes(b"OKAY", "little")
 ADB_WRTE = int.from_bytes(b"WRTE", "little")
+ADB_CLSE = int.from_bytes(b"CLSE", "little")
+
 ADB_VERSION = 0x01000001
 ADB_MAX_DATA = 1024 * 1024
 ADB_SIDELOAD_CHUNK_SIZE = 1024 * 64
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
-USB_TIMEOUT_MS = 3000
+USB_TIMEOUT_MS = 30000
 LIBUSB_ERROR_NO_DEVICE = -4
 LIBUSB_ERROR_NOT_FOUND = -5
 LIBUSB_ERROR_TIMEOUT = -7
@@ -574,14 +576,6 @@ def extract_validate(data):
     walk(data)
     return result
 
-def _confirm(question, expected="YES"):
-    try:
-        answer = input(f"{question}\nType {expected} to continue: ")
-    except EOFError:
-        return False
-    return answer.strip() == expected
-
-
 def _confirm_erase(erase):
     if str(erase) == "0":
         return True
@@ -665,53 +659,53 @@ def check_rom():
             print("\nNo ROM can be installed on this device !.")
 
 
-def send_simple(command):
-    transport = get_transport()
-    print(adb_cmd(transport, command))
 
-def send_destructive(command, warning):
-    print(f"\n{warning}")
-    if not _confirm("This cannot be undone."):
+def run_adb(command):
+    return adb_cmd(get_transport(), command)
+
+def confirm_or_cancel(message):
+    print(f"\n{message}")
+    if input("This cannot be undone.\nType YES to continue: ").strip() != "YES":
         print("Operation cancelled.")
-        return
-    send_simple(command)
+        return False
+    return True
+
+def guarded_format(message, command):
+    if confirm_or_cancel(message):
+        print(run_adb(command))
 
 def format_data():
-    send_destructive("format-data:", "This will erase all user data on the device.")
-
+    guarded_format("This will erase all user data on the device.", "format-data:")
 def format_cache():
-    send_simple("format-cache:")
+    print(run_adb("format-cache:"))
 
 def format_storage():
-    send_destructive("format-storage:", "This will erase the internal storage (photos, files).")
-
+    guarded_format("This will erase the internal storage (photos, files).", "format-storage:")
 def format_data_storage():
-    send_destructive("format-data-storage:", "This will erase user data AND internal storage.")
+    guarded_format("This will erase user data AND internal storage.", "format-data-storage:")
 
 def format_frp():
-    send_destructive("format-frp:", "This will erase the FRP (factory reset protection) partition.")
-
+    mitoken = run_adb("getmitoken:")
+    print(f"MiToken: {mitoken}")
+    signed = input("signedMiToken: ").strip()
+    print(run_adb(f"format-frp:{signed}"))
 def wipe_data_storage():
-    send_destructive("wipe-data-storage:", "This will wipe user data and internal storage.")
+    guarded_format("This will wipe user data and internal storage.", "wipe-data-storage:")
 
 def wipe_efs():
     print("\n[WARNING]: If you are a normal user and don't know what this means, DO NOT use this command!")
     print("Wiping EFS will permanently break your phone's network and delete your IMEI.")
-    confirm = input("Type 'YES' only if you are an expert and know exactly what you are doing: ")  
-    if confirm == "YES":
-        print("Wiping EFS partition...")
-        send_simple("wipe-efs:")
-    else:
+    if input("Type YES only if you are an expert and know exactly what you are doing: ").strip() != "YES":
         print("Operation cancelled.")
-
+        return
+    print("Wiping EFS partition...")
+    print(run_adb("wipe-efs:"))
 
 def send_disconnecting(command, verb):
-    transport = get_transport()
     try:
-        print(adb_cmd(transport, command))
+        print(run_adb(command))
     except DeviceTimeout:
         print(f"Device is {verb} (connection closed as expected).")
-
 
 def reboot():
     send_disconnecting("reboot:", "rebooting")
@@ -725,9 +719,11 @@ def reboot_fastboot():
 def reboot_bootloader():
     send_disconnecting("bootloader:", "rebooting to bootloader")
 
-
 def shutdown():
     send_disconnecting("shutdown:", "shutting down")
+
+def wipe_data_storage():
+    guarded_format("This will wipe user data and internal storage.", "wipe-data-storage:")
 
 
 ACTION_HANDLERS = {
