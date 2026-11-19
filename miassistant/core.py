@@ -765,13 +765,13 @@ def reboot():
     send_disconnecting("reboot:", "rebooting")
 
 def reboot_recovery():
-    send_disconnecting("recovery:", "rebooting to recovery")
+    send_disconnecting("reboot:recovery", "rebooting to recovery")
 
 def reboot_fastboot():
-    send_disconnecting("fastboot:", "rebooting to fastboot")
+    send_disconnecting("reboot:fastboot", "rebooting to fastboot")
 
 def reboot_bootloader():
-    send_disconnecting("bootloader:", "rebooting to bootloader")
+    send_disconnecting("reboot:bootloader", "rebooting to bootloader")
 
 def shutdown():
     send_disconnecting("shutdown:", "shutting down")
