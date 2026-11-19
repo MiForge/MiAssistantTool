@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.4.8
+- Minor fixes and improvements
+
 ## 1.4.7
 - Minor fixes and improvements
 
