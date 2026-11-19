@@ -38,7 +38,7 @@ ADB_VERSION = 0x01000001
 ADB_MAX_DATA = 1024 * 1024
 ADB_SIDELOAD_CHUNK_SIZE = 1024 * 64
 LIBUSB_OPTION_NO_DEVICE_DISCOVERY = 2
-USB_TIMEOUT_MS = 8000
+USB_TIMEOUT_MS = 10000
 LIBUSB_ERROR_NO_DEVICE = -4
 LIBUSB_ERROR_NOT_FOUND = -5
 LIBUSB_ERROR_TIMEOUT = -7
@@ -312,7 +312,9 @@ def adb_connect(transport):
 
 
 def adb_cmd(transport, command):
-    send_packet(transport, ADB_OPEN, 1, 0, command.encode() + b"\x00")
+    local_id = transport.get("next_id", 1)
+    transport["next_id"] = local_id + 1
+    send_packet(transport, ADB_OPEN, local_id, 0, command.encode() + b"\x00")
 
     response = None
     closed = False
@@ -323,8 +325,12 @@ def adb_cmd(transport, command):
         except DeviceTimeout:
             continue
 
+        if arg1 != local_id:
+            continue
+
         if cmd == ADB_CLSE:
             closed = True
+            send_packet(transport, ADB_CLSE, local_id, arg0)
             break
 
         if cmd == ADB_OKAY:
@@ -351,7 +357,10 @@ def adb_cmd(transport, command):
 def start_sideload(transport, file_path, validate):
     file_size = os.path.getsize(file_path)
     service = (f"sideload-host:{file_size}:{ADB_SIDELOAD_CHUNK_SIZE}:{validate}:0").encode() + b"\x00"
-    send_packet(transport, ADB_OPEN, 1, 0, service)
+
+    local_id = transport.get("next_id", 1)
+    transport["next_id"] = local_id + 1
+    send_packet(transport, ADB_OPEN, local_id, 0, service)
 
     total_sent = 0
     final_message = ""
@@ -385,6 +394,9 @@ def start_sideload(transport, file_path, validate):
                 continue
             io_errors = 0
             last_activity = time.monotonic()
+
+            if arg1 != local_id:
+                continue
 
             if cmd == ADB_CLSE:
                 if final_message:
@@ -479,8 +491,6 @@ def get_info():
             }
         except DeviceTimeout:
             sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
-        except DeviceIOError as e:
-            sys.exit(f"\n\nError while reading device info: {e}\n\n")
     return _info
 
 
@@ -748,9 +758,7 @@ def wipe_efs():
 def send_disconnecting(command, verb):
     try:
         print(run_adb(command))
-    except DeviceTimeout:
-        print(f"Device is {verb} (connection closed as expected).")
-    except DeviceIOError:
+    except (DeviceTimeout, DeviceWriteError):
         print(f"Device is {verb} (connection closed as expected).")
 
 def reboot():
