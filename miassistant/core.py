@@ -3,6 +3,7 @@ import json
 import platform
 import base64
 import re
+import stat
 import urllib.parse
 import requests
 import usb.core
@@ -14,6 +15,7 @@ import sys
 import time
 import hashlib
 import pyaes
+from functools import partial
 from rsa import PublicKey
 
 _BACKEND = None
@@ -46,8 +48,29 @@ MAX_CONSECUTIVE_IO_ERRORS = 10
 SIDELOAD_IDLE_LIMIT = 900
 MAX_CONSECUTIVE_WRITE_ERRORS = 20
 HTTP_TIMEOUT = (10, 30)
+SYNC_IDLE_LIMIT = 30
+SYNC_MAX_PATH = 1024
 
 _banner = {}
+_transport = None
+_info = None
+
+
+class DeviceWriteError(Exception):
+    pass
+
+
+class DeviceTimeout(Exception):
+    pass
+
+
+class DeviceDisconnected(DeviceTimeout):
+    pass
+
+
+class DeviceIOError(DeviceTimeout):
+    pass
+
 
 class EPDesc(ctypes.Structure):
     _fields_ = [
@@ -85,44 +108,6 @@ class ConfigDesc(ctypes.Structure):
     ]
 
 
-def is_nonroot_termux():
-    return (
-        bool(os.environ.get("PREFIX"))
-        and os.path.exists("/data/data/com.termux")
-        and hasattr(os, "geteuid")
-        and os.geteuid() != 0
-    )
-
-
-def find_adb_endpoints_raw(lib, dev):
-    lib.libusb_get_active_config_descriptor.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ConfigDesc))]
-    lib.libusb_get_active_config_descriptor.restype = ctypes.c_int
-    cfg = ctypes.POINTER(ConfigDesc)()
-    if lib.libusb_get_active_config_descriptor(dev, ctypes.byref(cfg)) != 0:
-        return None, None
-    for i in range(cfg.contents.bNumInterfaces):
-        intf = cfg.contents.interface[i]
-        if intf.num_altsetting == 0:
-            continue
-        alt = intf.altsetting[0]
-        if (alt.bInterfaceClass, alt.bInterfaceSubClass, alt.bInterfaceProtocol) != (
-            B_INTERFACE_CLASS, B_INTERFACE_SUBCLASS, B_INTERFACE_PROTOCOL
-        ):
-            continue
-        ep_out = ep_in = None
-        for e in range(alt.bNumEndpoints):
-            ep = alt.endpoint[e]
-            if ep.bmAttributes & 0x03 != 0x02:
-                continue
-            if ep.bEndpointAddress & 0x80:
-                ep_in = ep.bEndpointAddress
-            else:
-                ep_out = ep.bEndpointAddress
-        if ep_out is not None and ep_in is not None:
-            return ep_out, ep_in
-    return None, None
-
-
 def connect_termux_nonroot():
     fd = os.environ.get("TERMUX_USB_FD")
     if fd is None:
@@ -139,12 +124,11 @@ def connect_termux_nonroot():
     lib.libusb_set_option(None, LIBUSB_OPTION_NO_DEVICE_DISCOVERY)
 
     backend = m._LibUSB(lib)
-    ctx = backend.ctx
 
     lib.libusb_wrap_sys_device.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.POINTER(ctypes.c_void_p)]
     lib.libusb_wrap_sys_device.restype = ctypes.c_int
     handle = ctypes.c_void_p()
-    rc = lib.libusb_wrap_sys_device(ctx, fd, ctypes.byref(handle))
+    rc = lib.libusb_wrap_sys_device(backend.ctx, fd, ctypes.byref(handle))
     if rc != 0 or not handle.value:
         sys.exit(f"\n\ndevice is not connected, or not in mi assistant mode (libusb error {rc})\n\n")
 
@@ -152,7 +136,33 @@ def connect_termux_nonroot():
     lib.libusb_get_device.restype = ctypes.c_void_p
     dev = lib.libusb_get_device(handle)
 
-    ep_out, ep_in = find_adb_endpoints_raw(lib, dev)
+    lib.libusb_get_active_config_descriptor.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ConfigDesc))]
+    lib.libusb_get_active_config_descriptor.restype = ctypes.c_int
+    cfg = ctypes.POINTER(ConfigDesc)()
+    ep_out = ep_in = None
+    if lib.libusb_get_active_config_descriptor(dev, ctypes.byref(cfg)) == 0:
+        for i in range(cfg.contents.bNumInterfaces):
+            intf = cfg.contents.interface[i]
+            if intf.num_altsetting == 0:
+                continue
+            alt = intf.altsetting[0]
+            if (alt.bInterfaceClass, alt.bInterfaceSubClass, alt.bInterfaceProtocol) != (
+                B_INTERFACE_CLASS, B_INTERFACE_SUBCLASS, B_INTERFACE_PROTOCOL
+            ):
+                continue
+            ep_out = ep_in = None
+            for e in range(alt.bNumEndpoints):
+                ep = alt.endpoint[e]
+                if ep.bmAttributes & 0x03 != 0x02:
+                    continue
+                if ep.bEndpointAddress & 0x80:
+                    ep_in = ep.bEndpointAddress
+                else:
+                    ep_out = ep.bEndpointAddress
+            if ep_out is not None and ep_in is not None:
+                break
+        else:
+            ep_out = ep_in = None
     if ep_out is None:
         sys.exit("\n\ndevice is not connected, or not in mi assistant mode\n\n")
 
@@ -201,6 +211,15 @@ def connect_normal():
     return None
 
 
+def is_nonroot_termux():
+    return (
+        bool(os.environ.get("PREFIX"))
+        and os.path.exists("/data/data/com.termux")
+        and hasattr(os, "geteuid")
+        and os.geteuid() != 0
+    )
+
+
 def connect():
     transport = connect_termux_nonroot() if is_nonroot_termux() else connect_normal()
     if not transport:
@@ -208,27 +227,23 @@ def connect():
     return transport
 
 
-class DeviceWriteError(Exception):
-    pass
-
-
-def _pyusb_no_device(error):
-    return (getattr(error, "backend_error_code", None) == LIBUSB_ERROR_NO_DEVICE
-            or getattr(error, "errno", None) == 19)
-
-
-def _pyusb_is_timeout(error):
+def _pyusb_error_kind(error):
+    code = getattr(error, "backend_error_code", None)
+    errno = getattr(error, "errno", None)
     timeout_error = getattr(usb.core, "USBTimeoutError", None)
-    return ((timeout_error is not None and isinstance(error, timeout_error))
-            or getattr(error, "backend_error_code", None) == LIBUSB_ERROR_TIMEOUT
-            or getattr(error, "errno", None) == 110)
+    if code == LIBUSB_ERROR_NO_DEVICE or errno == 19:
+        return "no_device"
+    if (timeout_error is not None and isinstance(error, timeout_error)) or code == LIBUSB_ERROR_TIMEOUT or errno == 110:
+        return "timeout"
+    return "other"
+
 
 def usb_write(transport, data):
     if transport["kind"] == "pyusb":
         try:
             transport["out_ep"].write(data, timeout=USB_TIMEOUT_MS)
         except usb.core.USBError as e:
-            if _pyusb_no_device(e):
+            if _pyusb_error_kind(e) == "no_device":
                 raise DeviceDisconnected(str(e))
             raise DeviceWriteError(str(e))
     else:
@@ -248,9 +263,10 @@ def usb_read(transport, size):
         try:
             return bytes(transport["in_ep"].read(size, timeout=USB_TIMEOUT_MS))
         except usb.core.USBError as e:
-            if _pyusb_no_device(e):
+            kind = _pyusb_error_kind(e)
+            if kind == "no_device":
                 raise DeviceDisconnected(str(e))
-            if _pyusb_is_timeout(e):
+            if kind == "timeout":
                 return b""
             raise DeviceIOError(str(e))
     buf = ctypes.create_string_buffer(size)
@@ -272,17 +288,6 @@ def send_packet(transport, cmd, arg0, arg1, data=b""):
         usb_write(transport, data)
 
 
-class DeviceTimeout(Exception):
-    pass
-
-
-class DeviceDisconnected(DeviceTimeout):
-    pass
-
-
-class DeviceIOError(DeviceTimeout):
-    pass
-
 def read_packet(transport):
     header = usb_read(transport, 24)
     if len(header) < 24:
@@ -292,23 +297,6 @@ def read_packet(transport):
         raise DeviceIOError(f"Invalid ADB packet magic (cmd={cmd:#x})")
     data = usb_read(transport, length) if length else b""
     return cmd, arg0, arg1, data
-
-def parse_banner(data):
-    text = data.decode(errors="ignore").rstrip("\x00")
-    props = text.partition("::")[2]
-    return dict(item.split("=", 1) for item in props.split(";") if "=" in item)
-
-
-def adb_connect(transport):
-    send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
-    for _ in range(10):
-        try:
-            _, _, _, data = read_packet(transport)
-            if data.startswith(b"sideload::"):
-                return parse_banner(data)
-        except DeviceTimeout:
-            continue
-    sys.exit("device did not send a valid sideload banner")
 
 
 def adb_cmd(transport, command):
@@ -362,12 +350,14 @@ def start_sideload(transport, file_path, validate):
     transport["next_id"] = local_id + 1
     send_packet(transport, ADB_OPEN, local_id, 0, service)
 
-    total_sent = 0
+    total_blocks = max(1, -(-file_size // ADB_SIDELOAD_CHUNK_SIZE))
+    pass1 = set()
+    pass2 = set()
+    phase = 1
+
     final_message = ""
     last_activity = time.monotonic()
-    write_errors = 0
-    announced_wait = False
-    served_blocks = set()
+    near_end = False
     last_pct = -1
     io_errors = 0
 
@@ -380,8 +370,8 @@ def start_sideload(transport, file_path, validate):
             except DeviceIOError as e:
                 io_errors += 1
                 if io_errors >= MAX_CONSECUTIVE_IO_ERRORS:
-                    if announced_wait:
-                        sys.exit(f"\n\nThe device stopped responding after the transfer finished ({e}). "
+                    if near_end:
+                        sys.exit(f"\n\nThe device stopped responding near the end of the installation ({e}). "
                                  "It probably left sideload mode; check the phone screen and the installed version.\n\n")
                     sys.exit(f"\n\nError: repeated USB read errors ({e}). Aborting.\n\n")
                 time.sleep(0.1)
@@ -425,49 +415,71 @@ def start_sideload(transport, file_path, validate):
             f.seek(offset)
             chunk = f.read(to_write)
 
-            try:
-                send_packet(transport, ADB_WRTE, arg1, arg0, chunk)
-                send_packet(transport, ADB_OKAY, arg1, arg0)
-                write_errors = 0
-            except DeviceDisconnected:
-                sys.exit("\n\nError: the device was disconnected during the transfer.\n\n")
-            except DeviceWriteError as e:
-                write_errors += 1
-                if write_errors >= MAX_CONSECUTIVE_WRITE_ERRORS:
-                    sys.exit(f"\n\nError: repeated USB write failures ({e}). Aborting.\n\n")
-                continue
+            attempt = 0
+            while True:
+                try:
+                    send_packet(transport, ADB_WRTE, arg1, arg0, chunk)
+                    send_packet(transport, ADB_OKAY, arg1, arg0)
+                    break
+                except DeviceDisconnected:
+                    sys.exit("\n\nError: the device was disconnected during the transfer.\n\n")
+                except DeviceWriteError as e:
+                    attempt += 1
+                    if attempt >= 3:
+                        sys.exit(f"\n\nError: could not send block {block} ({e}). Aborting.\n\n")
+                    time.sleep(0.3)
 
-            if block not in served_blocks:
-                served_blocks.add(block)
-                total_sent += to_write
+            if block not in pass1:
+                pass1.add(block)
+            elif block not in pass2:
+                pass2.add(block)
 
-            pct = min(100, int(total_sent * 100 / file_size))
-            if pct != last_pct:
-                last_pct = pct
-                print(f"\rTransferring in progress ... {pct}/100%", end="", flush=True)
-            if pct >= 100 and not announced_wait:
-                announced_wait = True
-                print("\nTransfer finished. Waiting for the device to verify/install "
-                      "(this can take several minutes) ...", flush=True)
+            if phase == 1:
+                pct = int(len(pass1) * 100 / total_blocks)
+                if pct != last_pct:
+                    last_pct = pct
+                    print(f"\r[step 1/2] Transferring in progress ... {pct}/100%", end="", flush=True)
+                if len(pass1) >= total_blocks:
+                    phase = 2
+                    last_pct = 0
+                    print("\n[step 2/2] Installing in progress ... 0/100%", end="", flush=True)
+            else:
+                pct = min(99, int(len(pass2) * 100 / total_blocks))
+                if pct >= 99:
+                    near_end = True
+                if pct != last_pct:
+                    last_pct = pct
+                    print(f"\r[step 2/2] Installing in progress ... {pct}/100%", end="", flush=True)
+                    
+    if "complete" in final_message.lower():
+        step = "2/2" if phase == 2 else "1/2"
+        label = "Installing" if phase == 2 else "Transferring"
+        print(f"\r[step {step}] {label} in progress ... 100/100%", flush=True)                 
 
     print(f"\n\n{final_message}\n")
     return final_message
 
 
-_transport = None
-_connected = False
-_info = None
-
 def get_transport():
-    global _transport, _connected
+    global _transport
     if _transport is None:
-        _transport = connect()
-    if not _connected:
         try:
-            _banner.update(adb_connect(_transport))
+            transport = connect()
+            send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
+            for _ in range(10):
+                try:
+                    _, _, _, data = read_packet(transport)
+                except DeviceTimeout:
+                    continue
+                if data.startswith(b"sideload::"):
+                    props = data.decode(errors="ignore").rstrip("\x00").partition("::")[2]
+                    _banner.update(dict(item.split("=", 1) for item in props.split(";") if "=" in item))
+                    break
+            else:
+                sys.exit("device did not send a valid sideload banner")
         except DeviceTimeout:
             sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
-        _connected = True
+        _transport = transport
     return _transport
 
 
@@ -475,20 +487,10 @@ def get_info():
     global _info
     if _info is None:
         transport = get_transport()
+        fields = ["sn", "region", "device", "branch", "version", "romzone",
+                  "language", "codebase", "carrier", "mitoken", "recoveryversion"]
         try:
-            _info = {
-                "sn": adb_cmd(transport, "getsn:"),
-                "region": adb_cmd(transport, "getregion:"),
-                "device": adb_cmd(transport, "getdevice:"),
-                "branch": adb_cmd(transport, "getbranch:"),
-                "version": adb_cmd(transport, "getversion:"),
-                "romzone": adb_cmd(transport, "getromzone:"),
-                "language": adb_cmd(transport, "getlanguage:"),
-                "codebase": adb_cmd(transport, "getcodebase:"),
-                "carrier": adb_cmd(transport, "getcarrier:"),
-                "mitoken": adb_cmd(transport, "getmitoken:"),
-                "recoveryversion": adb_cmd(transport, "getrecoveryversion:"),
-            }
+            _info = {k: adb_cmd(transport, f"get{k}:") for k in fields}
         except DeviceTimeout:
             sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
     return _info
@@ -512,23 +514,6 @@ def read_info():
     print(f"Recovery Version: {info['recoveryversion']}")
 
 
-BLOCK_SIZE = 16
-
-def _pkcs7_pad(data):
-    p = BLOCK_SIZE - len(data) % BLOCK_SIZE
-    return data + bytes([p]) * p
-
-def _pkcs7_unpad(data):
-    return data[:-data[-1]]
-
-def _aes_cbc_encrypt(key, iv, data):
-    mode = pyaes.AESModeOfOperationCBC(key, iv=iv)
-    return b''.join(mode.encrypt(data[i:i+BLOCK_SIZE]) for i in range(0, len(data), BLOCK_SIZE))
-
-def _aes_cbc_decrypt(key, iv, data):
-    mode = pyaes.AESModeOfOperationCBC(key, iv=iv)
-    return b''.join(mode.decrypt(data[i:i+BLOCK_SIZE]) for i in range(0, len(data), BLOCK_SIZE))
-
 def _validate_request(info, md5):
     key = b"miuiotavalided11"
     iv = b"0102030405060708"
@@ -539,8 +524,8 @@ def _validate_request(info, md5):
         "options": {"zone": int(info["romzone"])},
         "pkg": md5,
     }
-    body = _pkcs7_pad(json.dumps(payload).encode())
-    enc = _aes_cbc_encrypt(key, iv, body)
+    encrypter = pyaes.Encrypter(pyaes.AESModeOfOperationCBC(key, iv=iv))
+    enc = encrypter.feed(json.dumps(payload).encode()) + encrypter.feed()
     q = urllib.parse.quote(base64.b64encode(enc).decode())
 
     try:
@@ -551,13 +536,14 @@ def _validate_request(info, md5):
             timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
-        dec = _aes_cbc_decrypt(key, iv, base64.b64decode(resp.text.strip()))
-        result = json.loads(_pkcs7_unpad(dec).decode("utf-8", errors="ignore"))
+        decrypter = pyaes.Decrypter(pyaes.AESModeOfOperationCBC(key, iv=iv))
+        dec = decrypter.feed(base64.b64decode(resp.text.strip())) + decrypter.feed()
+        return json.loads(dec.decode("utf-8", errors="ignore"))
     except requests.RequestException as e:
         sys.exit(f"\n\nNetwork error while contacting update.miui.com: {e}\n\n")
     except ValueError:
         sys.exit("\n\nUnexpected response from update.miui.com.\n\n")
-    return result
+
 
 def validate_decrypt(validate):
     PUBLIC_KEY_PEM = b"""-----BEGIN PUBLIC KEY-----
@@ -597,8 +583,9 @@ def file_info():
         if os.path.isfile(file_path) and file_path.lower().endswith(".zip"):
             break
         print("Invalid path or file is not a .zip. Try again.")
+    
+    print("\nCalculating checksums (MD5/SHA1) ...", flush=True)
 
-    print("Calculating checksums ...", flush=True)
     md5_hash = hashlib.md5()
     sha1_hash = hashlib.sha1()
     with open(file_path, "rb") as f:
@@ -607,6 +594,9 @@ def file_info():
             sha1_hash.update(chunk)
     md5_hex = md5_hash.hexdigest()
     sha1_hex = sha1_hash.hexdigest()
+
+    print(f"MD5 : {md5_hex}")
+    print(f"SHA1: {sha1_hex}\n")
 
     return file_path, md5_hex, sha1_hex
 
@@ -629,14 +619,9 @@ def extract_validate(data):
     walk(data)
     return result
 
-def _confirm_erase(erase):
-    if str(erase) == "0":
-        return True
-    if str(erase) == "1":
-        note = "NOTICE: Data will be erased during flashing."
-    else:
-        note = "NOTICE: Could not determine whether this package erases data; assume it will."
-    print(f"\n{note}")
+
+def confirm(message):
+    print(f"\n{message}")
     if input("This cannot be undone.\nType YES to continue: ").strip() != "YES":
         print("Operation cancelled.")
         return False
@@ -645,106 +630,73 @@ def _confirm_erase(erase):
 
 def flash_rom():
     path, md5, sha1 = file_info()
-
     info = get_info()
-    transport = get_transport()
-    r = _validate_request(info, md5)
+    pkg = _validate_request(info, md5).get("PkgRom", {})
 
-    if "PkgRom" in r and "Validate" in r["PkgRom"]:
-        validate = r["PkgRom"]["Validate"]
-        decrypted = validate_decrypt(validate)
-        if decrypted.get("SHA1") != sha1:
+    if "Validate" in pkg:
+        if validate_decrypt(pkg["Validate"]).get("SHA1") != sha1:
             print("SHA1 mismatch between local file and server response.")
             return
-        if not _confirm_erase(r["PkgRom"].get("Erase")):
-            return
-        start_sideload(transport, path, validate)
     else:
-        r2 = _validate_request(info, "")
-        checkv = extract_validate(r2)
-        for key, v in checkv.items():
-            decrypted = validate_decrypt(v['Validate'])
-            if decrypted.get("SHA1") == sha1:
-                if v['md5'] != md5:
-                    r3 = _validate_request(info, v['md5'])
-                    if "PkgRom" in r3 and "Validate" in r3["PkgRom"]:
-                        print("MD5 mismatch between local file and server response.")
-                        validate3 = r3["PkgRom"]["Validate"]
-                        if _confirm_erase(r3["PkgRom"].get("Erase")):
-                            start_sideload(transport, path, validate3)
-                    else:
-                        print("The server did not return a flashable package for this file.")
-                else:
-                    if _confirm_erase(v.get('Erase')):
-                        start_sideload(transport, path, v['Validate'])
-                break
+        checkv = extract_validate(_validate_request(info, ""))
+        for v in checkv.values():
+            if validate_decrypt(v["Validate"]).get("SHA1") != sha1:
+                continue
+            pkg = v
+            if v["md5"] != md5:
+                pkg = _validate_request(info, v["md5"]).get("PkgRom", {})
+                if "Validate" not in pkg:
+                    print("The server did not return a flashable package for this file.")
+                    return
+                print("MD5 mismatch between local file and server response.")
+            break
         else:
-            valid = []
-            for key, v in checkv.items():
-                r4 = _validate_request(info, v['md5'])
-                if "PkgRom" in r4 and "Validate" in r4["PkgRom"]:
-                    pkg = r4["PkgRom"]
-                    link = f"https://bigota.d.miui.com/{pkg['version']}/{pkg['filename']}"
-                    valid.append((pkg['md5'], link))
-            if valid:
-                print("\nROMs that can be flashed on this device:")
-                for md5v, link in valid:
-                    print(f"\nmd5: {md5v}\ndownload_url: {link}\n")
-            else:
-                print("\nNo ROM can be installed on this device !.")
+            return check_rom(checkv)
+
+    erase = str(pkg.get("Erase"))
+    if erase != "0":
+        note = ("NOTICE: Data will be erased during flashing." if erase == "1"
+                else "NOTICE: Could not determine whether this package erases data; assume it will.")
+        if not confirm(note):
+            return
+    start_sideload(get_transport(), path, pkg["Validate"])
 
 
-def check_rom():
+def check_rom(checkv=None):
     info = get_info()
-    r2 = _validate_request(info, "")
-    checkv = extract_validate(r2)
+    if checkv is None:
+        checkv = extract_validate(_validate_request(info, ""))
     valid = []
-    for key, v in checkv.items():
-        r4 = _validate_request(info, v['md5'])
-        if "PkgRom" in r4 and "Validate" in r4["PkgRom"]:
-            pkg = r4["PkgRom"]
-            link = f"https://bigota.d.miui.com/{pkg['version']}/{pkg['filename']}"
-            valid.append((pkg['md5'], link))
+    for v in checkv.values():
+        pkg = _validate_request(info, v["md5"]).get("PkgRom", {})
+        if "Validate" in pkg:
+            valid.append((pkg["md5"], f"https://bigota.d.miui.com/{pkg['version']}/{pkg['filename']}"))
     if valid:
         print("\nROMs that can be flashed on this device:")
         for md5v, link in valid:
             print(f"\nmd5: {md5v}\ndownload_url: {link}\n")
     else:
-            print("\nNo ROM can be installed on this device !.")
+        print("\nNo ROM can be installed on this device !.")
 
 
+def run_action(command, warning=None):
+    if warning and not confirm(warning):
+        return
+    try:
+        print(adb_cmd(get_transport(), command))
+    except (DeviceTimeout, DeviceWriteError) as e:
+        if command.startswith(("reboot", "shutdown")):
+            print(f"Command sent: {command} (connection closed as expected).")
+        else:
+            print(f"{command.split(':')[0]} failed: {e}")
 
-def run_adb(command):
-    return adb_cmd(get_transport(), command)
-
-def confirm_or_cancel(message):
-    print(f"\n{message}")
-    if input("This cannot be undone.\nType YES to continue: ").strip() != "YES":
-        print("Operation cancelled.")
-        return False
-    return True
-
-def guarded_format(message, command):
-    if confirm_or_cancel(message):
-        print(run_adb(command))
-
-def format_data():
-    guarded_format("This will erase all user data on the device.", "format-data:")
-def format_cache():
-    print(run_adb("format-cache:"))
-
-def format_storage():
-    guarded_format("This will erase the internal storage (photos, files).", "format-storage:")
-def format_data_storage():
-    guarded_format("This will erase user data AND internal storage.", "format-data-storage:")
 
 def format_frp():
-    mitoken = run_adb("getmitoken:")
-    print(f"MiToken: {mitoken}")
+    transport = get_transport()
+    print(f"MiToken: {adb_cmd(transport, 'getmitoken:')}")
     signed = input("signedMiToken: ").strip()
-    print(run_adb(f"format-frp:{signed}"))
-def wipe_data_storage():
-    guarded_format("This will wipe user data and internal storage.", "wipe-data-storage:")
+    print(adb_cmd(transport, f"format-frp:{signed}"))
+
 
 def wipe_efs():
     print("\n[WARNING]: If you are a normal user and don't know what this means, DO NOT use this command!")
@@ -753,44 +705,226 @@ def wipe_efs():
         print("Operation cancelled.")
         return
     print("Wiping EFS partition...")
-    print(run_adb("wipe-efs:"))
+    print(adb_cmd(get_transport(), "wipe-efs:"))
 
-def send_disconnecting(command, verb):
+
+class _SyncStream:
+    def __init__(self, transport):
+        self.t = transport
+        self.local_id = transport.get("next_id", 1)
+        transport["next_id"] = self.local_id + 1
+        self.remote_id = None
+        self.closed = False
+        self.buf = bytearray()
+
+        send_packet(transport, ADB_OPEN, self.local_id, 0, b"sync:\x00")
+        last = time.monotonic()
+        while self.remote_id is None:
+            if self.closed:
+                raise DeviceIOError("the device refused the sync: service")
+            if self._pump():
+                last = time.monotonic()
+            elif time.monotonic() - last > SYNC_IDLE_LIMIT:
+                raise DeviceTimeout("timed out while opening the sync: service")
+
+    def _pump(self):
+        try:
+            cmd, arg0, arg1, data = read_packet(self.t)
+        except DeviceDisconnected:
+            raise
+        except DeviceTimeout:
+            return False
+        if arg1 != self.local_id:
+            return False
+        if cmd == ADB_OKAY:
+            if self.remote_id is None:
+                self.remote_id = arg0
+            send_packet(self.t, ADB_OKAY, self.local_id, self.remote_id)
+        elif cmd == ADB_WRTE:
+            self.buf += data
+            send_packet(self.t, ADB_OKAY, self.local_id, arg0)
+        elif cmd == ADB_CLSE:
+            self.closed = True
+        return True
+
+    def write(self, data):
+        send_packet(self.t, ADB_WRTE, self.local_id, self.remote_id, data)
+
+    def read(self, n):
+        last = time.monotonic()
+        while len(self.buf) < n:
+            if self.closed:
+                raise DeviceIOError("the device closed the channel before the reply was complete")
+            if self._pump():
+                last = time.monotonic()
+            elif time.monotonic() - last > SYNC_IDLE_LIMIT:
+                raise DeviceTimeout("timed out waiting for the device")
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+
+def sync_list_v2():
+    path = input("Enter remote directory to list [/cache/]: ").strip() or "/cache/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    print(f"Listing directory with LIS2: {path}")
+
+    raw_path = path.encode()
+    entries, buf, status = [], bytearray(), None
     try:
-        print(run_adb(command))
-    except (DeviceTimeout, DeviceWriteError):
-        print(f"Device is {verb} (connection closed as expected).")
+        if len(raw_path) > SYNC_MAX_PATH:
+            raise ValueError("path is too long")
+        stream = _SyncStream(get_transport())
+        stream.write(b"LIS2" + struct.pack("<I", len(raw_path)) + raw_path)
+        deadline = time.monotonic() + SYNC_IDLE_LIMIT
 
-def reboot():
-    send_disconnecting("reboot:", "rebooting")
+        while status is None and time.monotonic() < deadline and not (stream.closed and not stream.buf):
+            buf += stream.buf
+            stream.buf.clear()
+            while status is None:
+                tag = bytes(buf[:4])
+                if tag == b"DONE":
+                    status = "ok"
+                elif tag == b"FAIL":
+                    status = "bad"
+                elif len(buf) < 76:
+                    break
+                elif tag != b"DNT2":
+                    status = "bad"
+                else:
+                    name_len = struct.unpack_from("<I", buf, 72)[0]
+                    if name_len > SYNC_MAX_PATH:
+                        status = "bad"
+                    elif len(buf) < 76 + name_len:
+                        break
+                    else:
+                        entries.append({
+                            "name": bytes(buf[76:76 + name_len]).decode("utf-8", errors="replace"),
+                            "mode": struct.unpack_from("<I", buf, 24)[0],
+                            "size": struct.unpack_from("<Q", buf, 40)[0],
+                            "mtime": struct.unpack_from("<Q", buf, 56)[0],
+                        })
+                        del buf[:76 + name_len]
+            if status is None and not stream._pump():
+                time.sleep(0.01)
+    except (DeviceTimeout, DeviceWriteError, DeviceIOError, ValueError, OSError) as e:
+        print(f"LIS2 probe failed: {e}")
+        return
 
-def reboot_recovery():
-    send_disconnecting("reboot:recovery", "rebooting to recovery")
+    if status != "ok":
+        print("LIS2 returned an unrecognized response.")
+        return
+    if not entries:
+        print("Empty directory.")
+        return
+    entries = [e for e in entries if e["name"] not in (".", "..")]
+    if not entries:
+        print("Directory contains only . and ..")
+        return
 
-def reboot_fastboot():
-    send_disconnecting("reboot:fastboot", "rebooting to fastboot")
+    entries.sort(key=lambda e: (not stat.S_ISDIR(e["mode"]), e["name"].lower()))
+    print(f"\n{'Mode':<11} {'Size':>12}  {'Modified':<16}  Name")
+    print("-" * 60)
+    for e in entries:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(e["mtime"])) if e["mtime"] else "-"
+        print(f"{stat.filemode(e['mode']):<11} {e['size']:>12}  {when:<16}  {e['name']}")
+    print(f"\nTotal: {len(entries)} entries")
 
-def reboot_bootloader():
-    send_disconnecting("reboot:bootloader", "rebooting to bootloader")
 
-def shutdown():
-    send_disconnecting("shutdown:", "shutting down")
+def sync_pull_v2():
+    remote = input("Enter remote file path (eg: /cache/recovery/last_log) : ").strip()
+    if not remote:
+        print("Cancelled.")
+        return
+    default = os.path.basename(remote.rstrip("/")) or "pulled_file"
+    raw = input(f"Enter local save path [{default}]: ").strip().strip("\"'")
+    local = os.path.expanduser(raw) if raw else default
+    if os.path.isdir(local):
+        local = os.path.join(local, default)
+    print(f"Pulling {remote} -> {local}")
+
+    tmp_path = local + ".part"
+    buf = bytearray()
+    total = 0
+    try:
+        raw_path = remote.encode()
+        if len(raw_path) > SYNC_MAX_PATH:
+            raise ValueError("path is too long")
+        stream = _SyncStream(get_transport())
+        stream.write(b"RCV2" + struct.pack("<I", len(raw_path)) + raw_path)
+        stream.write(struct.pack("<II", 0, 0))
+        last_activity = time.monotonic()
+
+        with open(tmp_path, "wb") as out:
+            while True:
+                tag = bytes(buf[:4])
+                need = 4
+                if tag in (b"DATA", b"FAIL"):
+                    need = 8
+                    if len(buf) >= 8:
+                        n = struct.unpack_from("<I", buf, 4)[0]
+                        if tag == b"DATA" and n > ADB_MAX_DATA:
+                            raise DeviceIOError(f"invalid RCV2 data block size ({n})")
+                        need = 8 + n
+                elif tag == b"DONE":
+                    break
+                elif len(buf) >= 4:
+                    raise DeviceIOError(f"unexpected RCV2 reply: {tag!r}")
+
+                if len(buf) < need:
+                    if stream.buf:
+                        buf += stream.buf
+                        stream.buf.clear()
+                        last_activity = time.monotonic()
+                    elif stream.closed and len(buf) < 4:
+                        break
+                    elif not stream._pump():
+                        if time.monotonic() - last_activity > SYNC_IDLE_LIMIT:
+                            raise DeviceTimeout("timed out waiting for RCV2 data")
+                        time.sleep(0.01)
+                    continue
+
+                if tag == b"FAIL":
+                    raise DeviceIOError(f"RCV2 failed: {bytes(buf[8:need]).decode(errors='replace')}")
+                out.write(buf[8:need])
+                del buf[:need]
+                total += need - 8
+                last_activity = time.monotonic()
+                print(f"\rReceived {total / 1024 / 1024:.2f} MB", end="", flush=True)
+
+        os.replace(tmp_path, local)
+        print(f"\nDone. Saved {total} bytes to {local}")
+    except BaseException as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        if isinstance(e, (DeviceTimeout, DeviceWriteError, DeviceIOError, ValueError, OSError)):
+            print(f"\nError: {e}")
+        else:
+            raise
 
 
 ACTION_HANDLERS = {
     1: ("Read Info", read_info),
     2: ("Flash Official Recovery ROM", flash_rom),
     3: ("ROMs That Can Be Flashed", check_rom),
-    4: ("Format Data", format_data),
-    5: ("Format Cache", format_cache),
-    6: ("Format Storage", format_storage),
-    7: ("Format Data + Storage", format_data_storage),
+    4: ("Format Data", partial(run_action, "format-data:", "This will erase all user data on the device.")),
+    5: ("Format Cache", partial(run_action, "format-cache:")),
+    6: ("Format Storage", partial(run_action, "format-storage:", "This will erase the internal storage (photos, files).")),
+    7: ("Format Data + Storage", partial(run_action, "format-data-storage:", "This will erase user data AND internal storage.")),
     8: ("Format FRP", format_frp),
-    9: ("Wipe Data Storage", wipe_data_storage),
+    9: ("Wipe Data Storage", partial(run_action, "wipe-data-storage:", "This will wipe user data and internal storage.")),
     10: ("Wipe EFS", wipe_efs),
-    11: ("Reboot", reboot),
-    12: ("Reboot to recovery", reboot_recovery),
-    13: ("Reboot to fastboot", reboot_fastboot),
-    14: ("Reboot to bootloader", reboot_bootloader),
-    15: ("Shutdown", shutdown),
+    11: ("Reboot", partial(run_action, "reboot:")),
+    12: ("Reboot to recovery", partial(run_action, "reboot:recovery")),
+    13: ("Reboot to fastboot", partial(run_action, "reboot:fastboot")),
+    14: ("Reboot to bootloader", partial(run_action, "reboot:bootloader")),
+    15: ("Shutdown", partial(run_action, "shutdown:")),
+    16: ("Get Minidump", partial(run_action, "getminidump:")),
+    17: ("List Files", sync_list_v2),
+    18: ("Pull File", sync_pull_v2),
 }
