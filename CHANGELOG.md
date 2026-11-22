@@ -1,6 +1,6 @@
 # Changelog
 
-1.5.0
+## 1.5.0
 - Added Get Minidump, List Files, and Pull File
 - Improved flashing progress
 - Fixes and improvements
