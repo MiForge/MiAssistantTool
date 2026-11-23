@@ -649,6 +649,9 @@ def flash_rom():
                     print("The server did not return a flashable package for this file.")
                     return
                 print("MD5 mismatch between local file and server response.")
+                if validate_decrypt(pkg["Validate"]).get("SHA1") != sha1:
+                    print("SHA1 mismatch between local file and server response.")
+                    return
             break
         else:
             return check_rom(checkv)
