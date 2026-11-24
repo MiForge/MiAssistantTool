@@ -342,7 +342,9 @@ def adb_cmd(transport, command):
     return text[:-1] if text.endswith("\n") else text
 
 
+
 def start_sideload(transport, file_path, validate):
+
     file_size = os.path.getsize(file_path)
     service = (f"sideload-host:{file_size}:{ADB_SIDELOAD_CHUNK_SIZE}:{validate}:0").encode() + b"\x00"
 
@@ -450,7 +452,7 @@ def start_sideload(transport, file_path, validate):
                 if pct != last_pct:
                     last_pct = pct
                     print(f"\r[step 2/2] Installing in progress ... {pct}/100%", end="", flush=True)
-                    
+
     if "complete" in final_message.lower():
         step = "2/2" if phase == 2 else "1/2"
         label = "Installing" if phase == 2 else "Transferring"
@@ -461,25 +463,33 @@ def start_sideload(transport, file_path, validate):
 
 
 def get_transport():
-    global _transport
-    if _transport is None:
-        try:
-            transport = connect()
-            send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
-            for _ in range(10):
-                try:
-                    _, _, _, data = read_packet(transport)
-                except DeviceTimeout:
-                    continue
-                if data.startswith(b"sideload::"):
-                    props = data.decode(errors="ignore").rstrip("\x00").partition("::")[2]
-                    _banner.update(dict(item.split("=", 1) for item in props.split(";") if "=" in item))
-                    break
-            else:
-                sys.exit("device did not send a valid sideload banner")
-        except DeviceTimeout:
-            sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
-        _transport = transport
+    global _transport, ADB_SIDELOAD_CHUNK_SIZE
+    if _transport is not None:
+        return _transport
+    try:
+        transport = connect()
+        send_packet(transport, ADB_CNXN, ADB_VERSION, ADB_MAX_DATA, b"host::\x00")
+        for _ in range(10):
+            try:
+                _, _, maxdata, data = read_packet(transport)
+            except DeviceDisconnected:
+                raise
+            except DeviceTimeout:
+                continue
+            if data.startswith(b"sideload::"):
+                break
+        else:
+            sys.exit("device did not send a valid sideload banner")
+    except DeviceDisconnected:
+        sys.exit("\n\nError: the device was disconnected.\n\n")
+    except DeviceTimeout:
+        sys.exit("\n\nError: device did not respond in time. Make sure the screen is on and it is in Mi Assistant mode.\n\n")
+    except DeviceWriteError as e:
+        sys.exit(f"\n\nError: could not talk to the device ({e}).\n\n")
+    ADB_SIDELOAD_CHUNK_SIZE = maxdata
+    props = data.decode(errors="ignore").rstrip("\x00").partition("::")[2]
+    _banner.update(dict(i.split("=", 1) for i in props.split(";") if "=" in i))
+    _transport = transport
     return _transport
 
 
@@ -583,7 +593,7 @@ def file_info():
         if os.path.isfile(file_path) and file_path.lower().endswith(".zip"):
             break
         print("Invalid path or file is not a .zip. Try again.")
-    
+
     print("\nCalculating checksums (MD5/SHA1) ...", flush=True)
 
     md5_hash = hashlib.md5()
