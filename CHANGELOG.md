@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1
+- Use the device's maximum block size when transferring the ROM
+- improvements
+
 ## 1.5.0
 - Added Get Minidump, List Files, and Pull File
 - Improved flashing progress
